@@ -98,7 +98,7 @@ return {
     enabled = false,
   },
   {
-    "coder/claudecode.nvim",
+    "coalio/openclaude.nvim",
     dependencies = { "folke/snacks.nvim" },
     opts = {
       terminal_cmd = "/home/coal/.local/bin/claude",

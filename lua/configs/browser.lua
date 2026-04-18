@@ -1,5 +1,20 @@
 local M = {}
 
+local function close_alpha_buffer()
+  local current = vim.api.nvim_get_current_buf()
+  local current_name = vim.api.nvim_buf_get_name(current)
+  if current_name ~= "" and not current_name:match("^alpha://") then
+    return
+  end
+
+  local alphas = vim.fn.getbufinfo({ buflisted = 1 })
+  for _, buf in ipairs(alphas) do
+    if buf.name:match("^alpha://") then
+      pcall(vim.api.nvim_buf_delete, buf.bufnr, { force = true })
+    end
+  end
+end
+
 local function scandir(dir)
   local entries = {}
   local fs = vim.loop.fs_scandir(dir)
@@ -39,6 +54,8 @@ local function set_workspace(dir)
   pcall(function()
     require("persistence").load()
   end)
+
+  close_alpha_buffer()
 
   local ok, api = pcall(require, "nvim-tree.api")
   if ok then
@@ -113,6 +130,7 @@ function M.open(dir)
             local workspace = repo_root(entry.path) or vim.fn.fnamemodify(entry.path, ":h")
             vim.cmd("cd " .. vim.fn.fnameescape(workspace))
             vim.cmd("edit " .. vim.fn.fnameescape(entry.path))
+            close_alpha_buffer()
           end
         end)
       end
