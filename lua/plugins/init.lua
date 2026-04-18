@@ -69,6 +69,10 @@ return {
   {
     "nvim-tree/nvim-tree.lua",
     opts = {
+      sync_root_with_cwd = false,
+      update_focused_file = {
+        update_root = false,
+      },
       renderer = {
         root_folder_label = ":t",
         highlight_opened_files = "name",
@@ -81,7 +85,7 @@ return {
     lazy = false,
     config = function()
       require("project_nvim").setup({
-        manual_mode = false,
+        manual_mode = true,
       })
     end,
   },

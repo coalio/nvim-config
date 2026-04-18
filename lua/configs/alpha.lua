@@ -68,7 +68,7 @@ local function session_button(path, index)
   return startify.button(
     tostring(index),
     "  " .. label,
-    string.format("<cmd>cd %s | lua require('persistence').load()<CR>", vim.fn.fnameescape(dir))
+    string.format("<cmd>lua require('configs.browser').load_session(%q)<CR>", dir)
   )
 end
 
@@ -112,8 +112,8 @@ startify.config.opts.margin = 15
 
 startify.section.top_buttons.val = {
   startify.button("e", "  New file", ":ene <BAR> startinsert <CR>"),
-  startify.button("p", "  Recent Projects", ":Telescope projects<CR>"),
-  startify.button("f", "  Browse", ":lua require('configs.browser').open(vim.fn.expand('~'))<CR>"),
+  startify.button("p", "  Recent Projects", "<cmd>lua require('configs.browser').open_recent_projects()<CR>"),
+  startify.button("f", "  Browse", "<cmd>lua require('configs.browser').browse_home()<CR>"),
   startify.button("q", "󰅙  Quit NVIM", ":qa<CR>"),
 }
 

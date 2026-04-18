@@ -208,4 +208,3 @@ end, { expr = true, replace_keycodes = true, desc = "Intercept :q to keep layout
 vim.keymap.set('n', '<F4>', function() _G.smart_close(false) end, { desc = 'Close buffer (with confirmation)' })
 vim.keymap.set('n', '<leader>q', function() _G.smart_close(false) end, { desc = 'Close buffer, keep window' })
 
-vim.g.nvim_tree_respect_buf_cwd = 1
