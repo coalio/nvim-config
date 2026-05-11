@@ -4,7 +4,27 @@ local height = 12
 local terminal_buf
 local terminal_chan
 local problem_count = 0
+local problems_loading = false
+local diagnostics_loading_until = 0
+local diagnostics_loading_duration_ns = 4000000000
 local empty_problems_buf
+local winbar_marker = "NvChadBottomPane"
+local bottom_win
+local active_kind
+local problems_scope = "open"
+local auto_problem_folds = false
+local diagnostic_cache = {}
+local diagnostic_source_conflicts = {}
+local diagnostic_source_conflicts_loaded = false
+local pending_buffer_refreshes = {}
+local pending_problem_refresh
+local pending_problem_poll_generation = 0
+local diagnostic_refresh_requested_until = 0
+local local_diagnostic_refresh_requested_until = 0
+local reading_coc_diagnostics = false
+local last_diagnostic_list_ns = 0
+local last_diagnostic_list_result
+local pending_problems_focus = false
 
 local function is_valid_win(win)
   return win and vim.api.nvim_win_is_valid(win)
@@ -28,6 +48,35 @@ local function lock_window_to_buffer(win)
   pcall(vim.api.nvim_set_option_value, "winfixbuf", true, { scope = "local", win = win })
 end
 
+local function mark_bottom_pane_window(win, kind)
+  if is_valid_win(win) and kind then
+    vim.w[win].bottom_pane_kind = kind
+    bottom_win = win
+    active_kind = kind
+  end
+end
+
+local function clear_bottom_pane_window(win)
+  if win and is_valid_win(win) then
+    vim.w[win].bottom_pane_kind = nil
+  end
+
+  if not win or win == bottom_win then
+    bottom_win = nil
+    active_kind = nil
+  end
+end
+
+local function is_bottom_pane_winbar(win)
+  return is_valid_win(win) and vim.wo[win].winbar:find(winbar_marker, 1, true) ~= nil
+end
+
+local function clear_bottom_pane_winbar(win)
+  if is_bottom_pane_winbar(win) then
+    vim.wo[win].winbar = ""
+  end
+end
+
 local function set_winbar(win, active)
   if not is_valid_win(win) then
     return
@@ -35,12 +84,18 @@ local function set_winbar(win, active)
 
   local terminal_hl = active == "terminal" and "%#TabLineSel#" or "%#TabLine#"
   local problems_hl = active == "problems" and "%#TabLineSel#" or "%#TabLine#"
+  local problems_label = ""
+  if problems_loading then
+    problems_label = " (...)"
+  elseif problem_count > 0 then
+    problems_label = string.format(" (%d)", problem_count)
+  end
 
   vim.wo[win].winbar = table.concat {
     terminal_hl,
     "%@v:lua.NvChadBottomPaneTerminal@ Terminal %X",
     problems_hl,
-    string.format("%%@v:lua.NvChadBottomPaneProblems@ Problems (%d) %%X", problem_count),
+    string.format("%%@v:lua.NvChadBottomPaneProblems@ Problems%s %%X", problems_label),
     "%#TabLineFill#",
   }
 end
@@ -63,6 +118,24 @@ local function is_editor_window(win)
   local filetype = vim.bo[buf].filetype
 
   return buftype == "" and filetype ~= "NvimTree" and filetype ~= "trouble"
+end
+
+local function find_editor_window()
+  local current_win = vim.api.nvim_get_current_win()
+  if is_editor_window(current_win) then
+    return current_win
+  end
+
+  local previous_win = vim.fn.win_getid(vim.fn.winnr "#")
+  if is_editor_window(previous_win) then
+    return previous_win
+  end
+
+  for _, win in ipairs(vim.api.nvim_list_wins()) do
+    if is_editor_window(win) then
+      return win
+    end
+  end
 end
 
 local function is_buffer_target_window(win)
@@ -90,16 +163,12 @@ local function focus_buffer_target_window()
 end
 
 local function focus_editor_window()
-  if is_editor_window(vim.api.nvim_get_current_win()) then
-    return
+  local win = find_editor_window()
+  if win then
+    vim.api.nvim_set_current_win(win)
   end
 
-  for _, win in ipairs(vim.api.nvim_list_wins()) do
-    if is_editor_window(win) then
-      vim.api.nvim_set_current_win(win)
-      return
-    end
-  end
+  return win
 end
 
 local function close_terminal_windows()
@@ -109,6 +178,7 @@ local function close_terminal_windows()
 
   for _, win in ipairs(vim.api.nvim_list_wins()) do
     if is_valid_win(win) and vim.api.nvim_win_get_buf(win) == terminal_buf then
+      clear_bottom_pane_window(win)
       pcall(vim.api.nvim_win_close, win, true)
     end
   end
@@ -121,6 +191,7 @@ local function close_empty_problems_windows()
 
   for _, win in ipairs(vim.api.nvim_list_wins()) do
     if is_valid_win(win) and vim.api.nvim_win_get_buf(win) == empty_problems_buf then
+      clear_bottom_pane_window(win)
       pcall(vim.api.nvim_win_close, win, true)
     end
   end
@@ -142,6 +213,15 @@ local function close_trouble()
   local ok, trouble = pcall(require, "trouble")
   if not ok then
     return
+  end
+
+  for _, win in ipairs(vim.api.nvim_list_wins()) do
+    if is_valid_win(win) and vim.w[win].bottom_pane_kind == "problems" then
+      local buf = vim.api.nvim_win_get_buf(win)
+      if vim.bo[buf].filetype == "trouble" then
+        clear_bottom_pane_window(win)
+      end
+    end
   end
 
   pcall(trouble.close, "qflist")
@@ -174,15 +254,46 @@ local function is_bottom_pane_open()
   return find_window_for_buf(terminal_buf) ~= nil or find_window_for_buf(empty_problems_buf) ~= nil or trouble_is_open()
 end
 
+local function problems_pane_is_open()
+  return active_kind == "problems" or find_window_for_buf(empty_problems_buf) ~= nil or trouble_is_open()
+end
+
+local function current_window_is_problems_pane()
+  local win = vim.api.nvim_get_current_win()
+  if not is_valid_win(win) then
+    return false
+  end
+
+  if vim.w[win].bottom_pane_kind == "problems" then
+    return true
+  end
+
+  local buf = vim.api.nvim_win_get_buf(win)
+  return buf == empty_problems_buf or vim.bo[buf].filetype == "trouble"
+end
+
 local function refresh_winbars(active)
+  active = active or active_kind
+
   for _, win in ipairs(vim.api.nvim_list_wins()) do
     local buf = vim.api.nvim_win_get_buf(win)
+    local kind = vim.w[win].bottom_pane_kind
+
     if buf == terminal_buf then
+      kind = "terminal"
       lock_window_to_buffer(win)
-      set_winbar(win, active == "terminal" and "terminal" or nil)
-    elseif vim.bo[buf].filetype == "trouble" or buf == empty_problems_buf then
+      mark_bottom_pane_window(win, kind)
+      set_winbar(win, active == kind and kind or nil)
+    elseif buf == empty_problems_buf or (kind == "problems" and vim.bo[buf].filetype == "trouble") then
+      kind = "problems"
       lock_window_to_buffer(win)
-      set_winbar(win, active == "problems" and "problems" or nil)
+      mark_bottom_pane_window(win, kind)
+      set_winbar(win, active == kind and kind or nil)
+    elseif kind == "problems" and vim.bo[buf].buftype == "quickfix" then
+      lock_window_to_buffer(win)
+      set_winbar(win, active == kind and kind or nil)
+    else
+      clear_bottom_pane_winbar(win)
     end
   end
 end
@@ -194,15 +305,44 @@ local function ensure_empty_problems_buf()
     vim.bo[empty_problems_buf].buftype = "nofile"
     vim.bo[empty_problems_buf].swapfile = false
     vim.bo[empty_problems_buf].modifiable = true
-    vim.api.nvim_buf_set_lines(empty_problems_buf, 0, -1, false, {
-      "No problems.",
-      "",
-      "Diagnostics will appear here when available.",
-    })
+    vim.api.nvim_buf_set_lines(empty_problems_buf, 0, -1, false, {})
     vim.bo[empty_problems_buf].modifiable = false
   end
 
   return empty_problems_buf
+end
+
+local function set_empty_problems_content(kind)
+  local buf = ensure_empty_problems_buf()
+  local lines
+
+  if kind == "loading" then
+    if not problems_loading then
+      local uv = vim.uv or vim.loop
+      diagnostics_loading_until = uv and (uv.hrtime() + diagnostics_loading_duration_ns) or 0
+    end
+    problems_loading = true
+    problem_count = 0
+    lines = {
+      "Waiting for CoC to finish running diagnostics...",
+      "",
+      "Diagnostics will appear here when available.",
+    }
+  else
+    problems_loading = false
+    diagnostics_loading_until = 0
+    problem_count = 0
+    lines = {
+      "No problems.",
+      "",
+      "Diagnostics will appear here when available.",
+    }
+  end
+
+  vim.bo[buf].modifiable = true
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+  vim.bo[buf].modifiable = false
+  refresh_winbars("problems")
 end
 
 local function open_bottom_window(buf, active)
@@ -220,6 +360,7 @@ local function open_bottom_window(buf, active)
   vim.wo[win].relativenumber = false
   vim.wo[win].signcolumn = "no"
   lock_window_to_buffer(win)
+  mark_bottom_pane_window(win, active)
   set_winbar(win, active)
 
   return win
@@ -241,12 +382,15 @@ local function ensure_terminal()
 end
 
 function M.open_terminal(cmd)
+  pending_problems_focus = false
   close_trouble()
   close_empty_problems_windows()
 
   local win = ensure_terminal() or find_window_for_buf(terminal_buf) or open_bottom_window(terminal_buf, "terminal")
   vim.api.nvim_set_current_win(win)
+  mark_bottom_pane_window(win, "terminal")
   set_winbar(win, "terminal")
+  refresh_winbars("terminal")
 
   if cmd and cmd ~= "" then
     local chan = vim.bo[terminal_buf].channel or terminal_chan
@@ -257,6 +401,17 @@ function M.open_terminal(cmd)
 end
 
 local function diagnostic_type(severity)
+  local numeric_severity = tonumber(severity)
+  if numeric_severity == 1 then
+    return "E"
+  elseif numeric_severity == 2 then
+    return "W"
+  elseif numeric_severity == 3 then
+    return "I"
+  elseif numeric_severity == 4 then
+    return "H"
+  end
+
   severity = tostring(severity or ""):lower()
 
   if severity:find "error" then
@@ -265,32 +420,369 @@ local function diagnostic_type(severity)
     return "W"
   elseif severity:find "information" or severity:find "info" then
     return "I"
+  elseif severity:find "hint" then
+    return "H"
   end
 
   return "N"
 end
 
-local function update_coc_qflist()
-  if vim.fn.exists "*CocAction" == 0 then
-    vim.notify("coc.nvim is not loaded yet", vim.log.levels.WARN)
-    return false
+local function normalize_file(path)
+  if not path or path == "" then
+    return nil
   end
 
-  if vim.g.coc_service_initialized ~= 1 then
-    vim.notify("coc.nvim is still starting; try :Problems again in a moment", vim.log.levels.WARN)
-    return false
+  return vim.fn.fnamemodify(path, ":p")
+end
+
+local function normalize_diagnostic_source(source)
+  return tostring(source or ""):lower()
+end
+
+local function diagnostic_source(item)
+  return item.source and item.source ~= "" and item.source or "coc"
+end
+
+local function diagnostic_message(item)
+  return tostring(item.message or ""):gsub("%s+", " "):gsub("^%s+", ""):gsub("%s+$", "")
+end
+
+local function register_conflicting_diagnostic_source(source, conflicts)
+  local source_key = normalize_diagnostic_source(source)
+  if source_key == "" or type(conflicts) ~= "table" then
+    return
   end
 
-  local ok, diagnostics = pcall(vim.fn.CocAction, "diagnosticList")
+  diagnostic_source_conflicts[source_key] = diagnostic_source_conflicts[source_key] or {}
+  for _, conflict in ipairs(conflicts) do
+    local conflict_key = normalize_diagnostic_source(conflict)
+    if conflict_key ~= "" then
+      diagnostic_source_conflicts[source_key][conflict_key] = true
+    end
+  end
+end
+
+register_conflicting_diagnostic_source("local:pyright", { "Pyright" })
+
+local function diagnostic_file(item)
+  local file = normalize_file(item.file)
+  if file then
+    return file
+  end
+
+  local bufnr = tonumber(item.bufnr)
+  if bufnr and is_valid_buf(bufnr) then
+    return normalize_file(vim.api.nvim_buf_get_name(bufnr))
+  end
+end
+
+local function diagnostic_conflict_key(item)
+  return table.concat({
+    diagnostic_file(item) or "",
+    tostring(tonumber(item.lnum) or 0),
+    tostring(tonumber(item.col) or 0),
+    diagnostic_message(item),
+  }, "\31")
+end
+
+local function current_editor_buf()
+  local win = find_editor_window()
+  return win and vim.api.nvim_win_get_buf(win) or nil
+end
+
+local function current_editor_file()
+  local buf = current_editor_buf()
+  return buf and normalize_file(vim.api.nvim_buf_get_name(buf)) or nil
+end
+
+local function listed_file_buffer_items()
+  local items = {}
+
+  for _, info in ipairs(vim.fn.getbufinfo({ buflisted = 1 })) do
+    local buf = tonumber(info.bufnr)
+    local file = normalize_file(info.name)
+
+    if buf and file and vim.api.nvim_buf_is_valid(buf) and vim.fn.filereadable(file) == 1 then
+      local ok, buftype = pcall(vim.api.nvim_get_option_value, "buftype", { buf = buf })
+      if ok and buftype == "" then
+        table.insert(items, { buf = buf, file = file })
+      end
+    end
+  end
+
+  return items
+end
+
+local function listed_file_buffers()
+  local files = {}
+
+  for _, item in ipairs(listed_file_buffer_items()) do
+    files[item.file] = true
+  end
+
+  return files
+end
+
+local function diagnostic_is_in_scope(item, scope, current_buf, current_file)
+  local item_file = normalize_file(item.file)
+
+  if scope == "current" then
+    return (item.bufnr and current_buf and item.bufnr == current_buf) or (item_file and item_file == current_file)
+  end
+
+  return true
+end
+
+local function sort_diagnostics(diagnostics)
+  table.sort(diagnostics, function(a, b)
+    local a_level = tonumber(a.level) or 0
+    local b_level = tonumber(b.level) or 0
+    if a_level ~= b_level then
+      return a_level < b_level
+    end
+
+    local a_file = normalize_file(a.file) or ""
+    local b_file = normalize_file(b.file) or ""
+    if a_file ~= b_file then
+      return a_file < b_file
+    end
+
+    local a_lnum = tonumber(a.lnum) or 0
+    local b_lnum = tonumber(b.lnum) or 0
+    if a_lnum ~= b_lnum then
+      return a_lnum < b_lnum
+    end
+
+    return (tonumber(a.col) or 0) < (tonumber(b.col) or 0)
+  end)
+
+  return diagnostics
+end
+
+local function diagnostics_from_buffer_var(buf)
+  if not is_valid_buf(buf) or not vim.api.nvim_buf_is_loaded(buf) then
+    return nil
+  end
+
+  local file = normalize_file(vim.api.nvim_buf_get_name(buf))
+  if not file then
+    return nil
+  end
+
+  local ok, diagnostics = pcall(vim.api.nvim_buf_get_var, buf, "coc_diagnostic_map")
   if not ok or type(diagnostics) ~= "table" then
-    vim.notify("Could not read CoC diagnostics", vim.log.levels.WARN)
-    return false
+    return nil
   end
 
   local items = {}
   for _, item in ipairs(diagnostics) do
-    local source = item.source and item.source ~= "" and item.source or "coc"
-    local message = tostring(item.message or ""):gsub("%s+", " ")
+    if type(item) == "table" then
+      local copy = vim.tbl_extend("force", {}, item)
+      copy.file = normalize_file(copy.file) or file
+      copy.bufnr = copy.bufnr or buf
+      table.insert(items, copy)
+    end
+  end
+
+  if #items == 0 then
+    return nil
+  end
+
+  return items
+end
+
+local function buffer_diagnostic_count(buf)
+  if not is_valid_buf(buf) or not vim.api.nvim_buf_is_loaded(buf) then
+    return nil
+  end
+
+  local ok, info = pcall(vim.api.nvim_buf_get_var, buf, "coc_diagnostic_info")
+  if not ok or type(info) ~= "table" then
+    return nil
+  end
+
+  if type(info.total) == "number" then
+    return info.total
+  end
+
+  local total = 0
+  for _, key in ipairs { "error", "warning", "information", "hint" } do
+    total = total + (tonumber(info[key]) or 0)
+  end
+
+  return total
+end
+
+local function update_cache_from_buffer(buf, clear_missing)
+  if not is_valid_buf(buf) or not vim.api.nvim_buf_is_loaded(buf) or vim.bo[buf].buftype ~= "" then
+    return false
+  end
+
+  local file = normalize_file(vim.api.nvim_buf_get_name(buf))
+  if not file then
+    return false
+  end
+
+  local diagnostics = diagnostics_from_buffer_var(buf)
+  if diagnostics then
+    diagnostic_cache[file] = diagnostics
+
+    return true
+  elseif clear_missing and buffer_diagnostic_count(buf) == 0 then
+    diagnostic_cache[file] = nil
+    return true
+  end
+
+  return false
+end
+
+local function sync_cache_from_buffer_vars(clear_missing)
+  for _, item in ipairs(listed_file_buffer_items()) do
+    update_cache_from_buffer(item.buf, clear_missing)
+  end
+end
+
+local function prune_diagnostic_cache_to_open_buffers()
+  local open_files = listed_file_buffers()
+  local changed = false
+
+  for file in pairs(diagnostic_cache) do
+    if not open_files[file] then
+      diagnostic_cache[file] = nil
+      changed = true
+    end
+  end
+
+  return changed
+end
+
+local function update_diagnostic_cache(diagnostics)
+  local open_files = listed_file_buffers()
+  local grouped = {}
+
+  prune_diagnostic_cache_to_open_buffers()
+
+  for _, item in ipairs(diagnostics) do
+    local file = normalize_file(item.file)
+    if file and open_files[file] then
+      grouped[file] = grouped[file] or {}
+      table.insert(grouped[file], item)
+    end
+  end
+
+  for file, items in pairs(grouped) do
+    diagnostic_cache[file] = items
+  end
+end
+
+local function cached_diagnostics()
+  local items = {}
+
+  for _, diagnostics in pairs(diagnostic_cache) do
+    vim.list_extend(items, diagnostics)
+  end
+
+  return sort_diagnostics(items)
+end
+
+local function diagnostics_for_scope(diagnostics)
+  sync_cache_from_buffer_vars(false)
+  update_diagnostic_cache(diagnostics)
+
+  local current_buf = current_editor_buf()
+  local current_file = current_buf and normalize_file(vim.api.nvim_buf_get_name(current_buf)) or nil
+  local current_has_global_diagnostics = false
+  local current_diagnostics = {}
+
+  if current_file then
+    for _, item in ipairs(diagnostics) do
+      if diagnostic_is_in_scope(item, "current", current_buf, current_file) then
+        table.insert(current_diagnostics, item)
+      end
+
+      if normalize_file(item.file) == current_file then
+        current_has_global_diagnostics = true
+      end
+    end
+  end
+
+  if current_file and not current_has_global_diagnostics and buffer_diagnostic_count(current_buf) == 0 then
+    diagnostic_cache[current_file] = nil
+  end
+
+  if problems_scope == "open" then
+    return cached_diagnostics()
+  end
+
+  return sort_diagnostics(current_diagnostics)
+end
+
+local function coc_ready()
+  return vim.fn.exists "*CocAction" == 1 and vim.g.coc_service_initialized == 1
+end
+
+local function sync_local_diagnostic_adapter_metadata()
+  if diagnostic_source_conflicts_loaded or not coc_ready() then
+    return
+  end
+
+  local ok, local_diagnostics = pcall(require, "configs.local_diagnostics")
+  if not ok or type(local_diagnostics.adapters) ~= "function" then
+    return
+  end
+
+  local result = local_diagnostics.adapters()
+  if type(result) ~= "table" or result.ok == false or type(result.adapters) ~= "table" then
+    return
+  end
+
+  diagnostic_source_conflicts_loaded = true
+
+  for _, adapter in ipairs(result.adapters) do
+    if type(adapter) == "table" then
+      register_conflicting_diagnostic_source(adapter.source, adapter.conflictsWithSources)
+    end
+  end
+end
+
+local function suppress_conflicting_diagnostics(diagnostics)
+  sync_local_diagnostic_adapter_metadata()
+
+  local covered = {}
+  for _, item in ipairs(diagnostics) do
+    local conflicts = diagnostic_source_conflicts[normalize_diagnostic_source(diagnostic_source(item))]
+    if conflicts then
+      local key = diagnostic_conflict_key(item)
+      covered[key] = covered[key] or {}
+      for conflict_source in pairs(conflicts) do
+        covered[key][conflict_source] = true
+      end
+    end
+  end
+
+  if vim.tbl_isempty(covered) then
+    return diagnostics
+  end
+
+  local filtered = {}
+  for _, item in ipairs(diagnostics) do
+    local source = normalize_diagnostic_source(diagnostic_source(item))
+    local conflicts_for_key = covered[diagnostic_conflict_key(item)]
+    if not (conflicts_for_key and conflicts_for_key[source]) then
+      table.insert(filtered, item)
+    end
+  end
+
+  return filtered
+end
+
+local function set_qflist_from_diagnostics(diagnostics)
+  diagnostics = suppress_conflicting_diagnostics(diagnostics)
+
+  local items = {}
+  for _, item in ipairs(diagnostics) do
+    local source = diagnostic_source(item)
+    local message = diagnostic_message(item)
 
     table.insert(items, {
       filename = item.file,
@@ -311,78 +803,597 @@ local function update_coc_qflist()
 
   problem_count = #items
   refresh_winbars()
+  last_diagnostic_list_result = #items > 0
 
-  return #items > 0
+  return last_diagnostic_list_result
 end
 
-function M.open_problems()
-  local has_items = update_coc_qflist()
+local function cached_diagnostics_for_scope()
+  sync_cache_from_buffer_vars(false)
 
-  close_terminal_windows()
-  close_empty_problems_windows()
+  local diagnostics = cached_diagnostics()
+  if problems_scope == "open" then
+    return diagnostics
+  end
 
-  if has_items then
-    local ok, trouble = pcall(require, "trouble")
-    if ok then
-      trouble.open {
-        mode = "qflist",
-        focus = true,
-        refresh = true,
-        win = {
-          type = "split",
-          relative = "win",
-          position = "bottom",
-          size = height,
-          wo = {
-            winfixbuf = true,
-          },
-        },
-      }
+  local current_buf = current_editor_buf()
+  local current_file = current_buf and normalize_file(vim.api.nvim_buf_get_name(current_buf)) or nil
+  local current_diagnostics = {}
 
-      vim.schedule(function()
-        set_winbar(vim.api.nvim_get_current_win(), "problems")
-        refresh_winbars("problems")
-      end)
+  if not current_file then
+    return current_diagnostics
+  end
+
+  for _, item in ipairs(diagnostics) do
+    if diagnostic_is_in_scope(item, "current", current_buf, current_file) then
+      table.insert(current_diagnostics, item)
+    end
+  end
+
+  return sort_diagnostics(current_diagnostics)
+end
+
+local function update_qflist_from_cached_diagnostics()
+  local diagnostics = cached_diagnostics_for_scope()
+  if #diagnostics == 0 then
+    return false
+  end
+
+  return set_qflist_from_diagnostics(diagnostics)
+end
+
+local function update_coc_qflist(opts)
+  opts = opts or {}
+
+  if vim.fn.exists "*CocAction" == 0 then
+    if not opts.silent then
+      vim.notify("coc.nvim is not loaded yet", vim.log.levels.WARN)
+    end
+    return nil
+  end
+
+  if not coc_ready() then
+    if not opts.silent then
+      vim.notify("coc.nvim is still starting; try :Problems again in a moment", vim.log.levels.WARN)
+    end
+    return nil
+  end
+
+  if reading_coc_diagnostics then
+    return last_diagnostic_list_result
+  end
+
+  local uv = vim.uv or vim.loop
+  local now = uv and uv.hrtime() or 0
+  if not opts.force and now > 0 and last_diagnostic_list_ns > 0 and (now - last_diagnostic_list_ns) < 150000000 then
+    return last_diagnostic_list_result
+  end
+
+  reading_coc_diagnostics = true
+  local ok, diagnostics = pcall(vim.fn.CocAction, "diagnosticList")
+  reading_coc_diagnostics = false
+  last_diagnostic_list_ns = now
+
+  if not ok then
+    if not opts.silent then
+      vim.notify("Could not read CoC diagnostics", vim.log.levels.WARN)
+    end
+    return nil
+  end
+
+  if type(diagnostics) ~= "table" then
+    diagnostics = {}
+  end
+
+  diagnostics = diagnostics_for_scope(diagnostics)
+  return set_qflist_from_diagnostics(diagnostics)
+end
+
+local function refresh_problem_state_soon(delay)
+  if pending_problem_refresh then
+    return
+  end
+
+  pending_problem_refresh = vim.defer_fn(function()
+    pending_problem_refresh = nil
+
+    if problems_pane_is_open() then
+      M.refresh_problems({ silent = true })
+    end
+  end, delay or 150)
+end
+
+local function prepare_buffer_for_diagnostics(buf)
+  return is_valid_buf(buf) and vim.api.nvim_buf_is_loaded(buf) and vim.bo[buf].buftype == ""
+end
+
+local function request_coc_diagnostic_refresh()
+  if not coc_ready() or vim.fn.exists "*CocActionAsync" == 0 then
+    return false
+  end
+
+  local uv = vim.uv or vim.loop
+  if uv then
+    local now = uv.hrtime()
+    if diagnostic_refresh_requested_until > now then
+      return true
+    end
+    diagnostic_refresh_requested_until = now + 1500000000
+  end
+
+  local ok = pcall(vim.fn.CocActionAsync, "diagnosticRefresh")
+  return ok
+end
+
+local function request_local_diagnostic_refresh()
+  local uv = vim.uv or vim.loop
+  if uv then
+    local now = uv.hrtime()
+    if local_diagnostic_refresh_requested_until > now then
+      return true
+    end
+    local_diagnostic_refresh_requested_until = now + 2000000000
+  end
+
+  local ok, local_diagnostics = pcall(require, "configs.local_diagnostics")
+  if not ok or type(local_diagnostics.refresh_open) ~= "function" then
+    return false
+  end
+
+  return local_diagnostics.refresh_open()
+end
+
+local function clear_local_diagnostics_for_file(file)
+  if not file then
+    return
+  end
+
+  local ok, local_diagnostics = pcall(require, "configs.local_diagnostics")
+  if not ok or type(local_diagnostics.clear) ~= "function" then
+    return
+  end
+
+  pcall(local_diagnostics.clear, file)
+end
+
+local function remove_buffer_diagnostics(buf, file)
+  file = normalize_file(file)
+  if not file and is_valid_buf(buf) then
+    file = normalize_file(vim.api.nvim_buf_get_name(buf))
+  end
+
+  if file then
+    diagnostic_cache[file] = nil
+    clear_local_diagnostics_for_file(file)
+  end
+
+  prune_diagnostic_cache_to_open_buffers()
+
+  if problems_pane_is_open() then
+    refresh_problem_state_soon(10)
+  end
+end
+
+local function schedule_buffer_diagnostic_reload(buf)
+  if pending_buffer_refreshes[buf] then
+    return
+  end
+
+  pending_buffer_refreshes[buf] = vim.defer_fn(function()
+    pending_buffer_refreshes[buf] = nil
+
+    if not is_valid_buf(buf) then
       return
     end
 
+    if not prepare_buffer_for_diagnostics(buf) then
+      return
+    end
+
+    request_coc_diagnostic_refresh()
+    request_local_diagnostic_refresh()
+
+    vim.defer_fn(function()
+      update_cache_from_buffer(buf, true)
+      refresh_problem_state_soon(200)
+    end, 500)
+
+    vim.defer_fn(function()
+      update_cache_from_buffer(buf, true)
+      refresh_problem_state_soon(200)
+    end, 1500)
+
+    vim.defer_fn(function()
+      update_cache_from_buffer(buf, true)
+      refresh_problem_state_soon(200)
+    end, 3000)
+  end, 120)
+end
+
+local function schedule_problem_refreshes()
+  pending_problem_poll_generation = pending_problem_poll_generation + 1
+  local generation = pending_problem_poll_generation
+
+  for _, delay in ipairs({ 500, 1200, 2500, 4500, 7000 }) do
+    vim.defer_fn(function()
+      if generation ~= pending_problem_poll_generation then
+        return
+      end
+
+      if problems_pane_is_open() then
+        request_local_diagnostic_refresh()
+        sync_cache_from_buffer_vars(false)
+        M.refresh_problems({ silent = true })
+      end
+    end, delay)
+  end
+end
+
+function M.refresh_open_file_diagnostics()
+  if not problems_pane_is_open() then
+    return false
+  end
+
+  local uv = vim.uv or vim.loop
+  if uv then
+    diagnostics_loading_until = uv.hrtime() + diagnostics_loading_duration_ns
+  end
+
+  if not coc_ready() then
+    return false
+  end
+
+  request_coc_diagnostic_refresh()
+  request_local_diagnostic_refresh()
+  sync_cache_from_buffer_vars(false)
+  schedule_problem_refreshes()
+
+  return true
+end
+
+local function start_problem_diagnostics(delay, attempts, opts)
+  attempts = attempts or 0
+  opts = opts or {}
+
+  if not problems_pane_is_open() then
+    return
+  end
+
+  if not opts.background then
+    problems_loading = true
+    refresh_winbars("problems")
+  end
+
+  vim.defer_fn(function()
+    if not problems_pane_is_open() then
+      return
+    end
+
+    if M.refresh_open_file_diagnostics() then
+      vim.defer_fn(function()
+        if problems_pane_is_open() then
+          refresh_problem_state_soon(100)
+        end
+      end, 900)
+    elseif attempts < 40 then
+      start_problem_diagnostics(500, attempts + 1, opts)
+    end
+  end, delay or 0)
+end
+
+local function open_trouble_problems(focus)
+  local ok, trouble = pcall(require, "trouble")
+  if not ok then
+    return nil
+  end
+
+  local previous_win = vim.api.nvim_get_current_win()
+  local anchor_win = find_editor_window() or previous_win
+  local view = trouble.open {
+    mode = "qflist",
+    focus = focus ~= false,
+    refresh = true,
+    win = {
+      type = "split",
+      relative = "win",
+      position = "bottom",
+      size = height,
+      win = anchor_win,
+      wo = {
+        winfixbuf = true,
+      },
+    },
+  }
+
+  local function apply_problem_folds()
+    if not auto_problem_folds or problems_scope ~= "open" or not view or not view.renderer then
+      return
+    end
+
+    if current_window_is_problems_pane() then
+      return
+    end
+
+    local current_file = current_editor_file()
+    local folded = {}
+
+    for _, node in ipairs(view.renderer.root_nodes or {}) do
+      local node_file = node.item and normalize_file(node.item.filename)
+      if current_file and node_file == current_file then
+        folded[node.id] = nil
+      elseif not node:is_leaf() then
+        folded[node.id] = true
+      end
+    end
+
+    view.renderer._folded = folded
+    view:render()
+  end
+
+  local function document_trouble_keymaps(win)
+    if not is_valid_win(win) then
+      return
+    end
+
+    local buf = vim.api.nvim_win_get_buf(win)
+    vim.keymap.set("n", "s", function()
+      if not view then
+        return
+      end
+
+      local filter = view:get_filter("severity")
+      local severity = ((filter and filter.filter.severity or 0) + 1) % 5
+      view:filter({ severity = severity }, {
+        id = "severity",
+        template = "{hl:Title}Filter:{hl} {severity}",
+        del = severity == 0,
+      })
+    end, { buffer = buf, nowait = true, desc = "Problems: cycle severity filter" })
+  end
+
+  local function apply_trouble_winbar()
+    local win = view and view.win and view.win.win
+    if is_valid_win(win) then
+      mark_bottom_pane_window(win, "problems")
+      lock_window_to_buffer(win)
+      set_winbar(win, "problems")
+      document_trouble_keymaps(win)
+    end
+
+    apply_problem_folds()
+    refresh_winbars("problems")
+
+    if focus ~= false and is_valid_win(win) then
+      pcall(vim.api.nvim_set_current_win, win)
+    end
+
+    if focus == false and is_valid_win(previous_win) then
+      pcall(vim.api.nvim_set_current_win, previous_win)
+    end
+  end
+
+  if view and view.wait then
+    view:wait(apply_trouble_winbar)
+  else
+    vim.schedule(apply_trouble_winbar)
+  end
+  vim.defer_fn(apply_trouble_winbar, 50)
+
+  return view
+end
+
+local function open_empty_problems(focus, kind)
+  local previous_win = vim.api.nvim_get_current_win()
+  local buf = ensure_empty_problems_buf()
+  set_empty_problems_content(kind)
+  local win = find_window_for_buf(buf) or open_bottom_window(buf, "problems")
+
+  mark_bottom_pane_window(win, "problems")
+  set_winbar(win, "problems")
+  refresh_winbars("problems")
+
+  if focus ~= false then
+    vim.api.nvim_set_current_win(win)
+  elseif is_valid_win(previous_win) then
+    pcall(vim.api.nvim_set_current_win, previous_win)
+  end
+
+  return win
+end
+
+local function open_cached_problems(focus)
+  if not update_qflist_from_cached_diagnostics() then
+    return false
+  end
+
+  pending_problems_focus = focus ~= false
+  problems_loading = false
+  diagnostics_loading_until = 0
+  close_empty_problems_windows()
+
+  if not open_trouble_problems(focus) then
     vim.cmd("belowright " .. height .. "copen")
-    lock_window_to_buffer(vim.api.nvim_get_current_win())
-    set_winbar(vim.api.nvim_get_current_win(), "problems")
+    local win = vim.api.nvim_get_current_win()
+    mark_bottom_pane_window(win, "problems")
+    lock_window_to_buffer(win)
+    set_winbar(win, "problems")
+
+    if focus == false then
+      focus_editor_window()
+    end
+  end
+
+  refresh_winbars("problems")
+  return true
+end
+
+local function open_cached_qflist_problems(focus)
+  local info = vim.fn.getqflist({ title = 1, size = 1 })
+  if type(info) ~= "table" or info.title ~= "CoC Problems" or (tonumber(info.size) or 0) == 0 then
+    return false
+  end
+
+  pending_problems_focus = focus ~= false
+  problems_loading = false
+  diagnostics_loading_until = 0
+  problem_count = tonumber(info.size) or problem_count
+  close_empty_problems_windows()
+
+  if not open_trouble_problems(focus) then
+    vim.cmd("belowright " .. height .. "copen")
+    local win = vim.api.nvim_get_current_win()
+    mark_bottom_pane_window(win, "problems")
+    lock_window_to_buffer(win)
+    set_winbar(win, "problems")
+
+    if focus == false then
+      focus_editor_window()
+    end
+  end
+
+  refresh_winbars("problems")
+  return true
+end
+
+function M.open_problems()
+  close_terminal_windows()
+  close_trouble()
+  close_empty_problems_windows()
+
+  pending_problems_focus = true
+  if open_cached_problems(true) or open_cached_qflist_problems(true) then
+    start_problem_diagnostics(0, 0, { background = true })
+    return
+  end
+
+  if last_diagnostic_list_ns > 0 and last_diagnostic_list_result == false then
+    open_empty_problems(true, "empty")
+    start_problem_diagnostics(0, 0, { background = true })
+    return
+  end
+
+  open_empty_problems(true, "loading")
+  start_problem_diagnostics()
+end
+
+function M.refresh_problems(opts)
+  opts = opts or {}
+  local ok, trouble = pcall(require, "trouble")
+  local problems_was_open = active_kind == "problems" or find_window_for_buf(empty_problems_buf) ~= nil or trouble_is_open()
+  local focus_problems = pending_problems_focus or current_window_is_problems_pane()
+  local has_items = update_coc_qflist(opts)
+
+  if not problems_was_open then
+    refresh_winbars()
+    return
+  end
+
+  if has_items == nil then
+    if problem_count > 0 and (trouble_is_open() or #vim.fn.getqflist() > 0) then
+      refresh_winbars("problems")
+      return
+    end
+
+    open_empty_problems(focus_problems, "loading")
+    return
+  end
+
+  if has_items then
+    pending_problems_focus = false
+    problems_loading = false
+    diagnostics_loading_until = 0
+
+    if ok and trouble.is_open "qflist" then
+      open_trouble_problems(focus_problems)
+    else
+      close_empty_problems_windows()
+      if not open_trouble_problems(focus_problems) then
+        vim.cmd("belowright " .. height .. "copen")
+        local win = vim.api.nvim_get_current_win()
+        mark_bottom_pane_window(win, "problems")
+        lock_window_to_buffer(win)
+        set_winbar(win, "problems")
+        if not focus_problems then
+          focus_editor_window()
+        end
+      end
+    end
+
     refresh_winbars("problems")
     return
   end
 
-  close_trouble()
-  local buf = ensure_empty_problems_buf()
-  local win = find_window_for_buf(buf) or open_bottom_window(buf, "problems")
-  vim.api.nvim_set_current_win(win)
-  set_winbar(win, "problems")
-  refresh_winbars("problems")
-end
-
-function M.refresh_problems()
-  local ok, trouble = pcall(require, "trouble")
-  local has_items = update_coc_qflist()
-
-  if ok and trouble.is_open "qflist" then
-    if has_items then
-      pcall(trouble.refresh, "qflist")
-    else
-      close_trouble()
-      local buf = ensure_empty_problems_buf()
-      local win = find_window_for_buf(buf) or open_bottom_window(buf, "problems")
-      set_winbar(win, "problems")
-    end
+  local uv = vim.uv or vim.loop
+  if problems_loading and uv and diagnostics_loading_until > uv.hrtime() then
+    open_empty_problems(focus_problems, "loading")
+    return
   end
 
-  refresh_winbars()
+  pending_problems_focus = false
+  problems_loading = false
+  diagnostics_loading_until = 0
+
+  if ok and trouble.is_open "qflist" then
+    close_trouble()
+  end
+
+  open_empty_problems(focus_problems, "empty")
+end
+
+function M.set_problems_scope(scope)
+  if scope ~= "current" and scope ~= "open" then
+    vim.notify("Problems scope must be 'current' or 'open'", vim.log.levels.WARN)
+    return
+  end
+
+  local changed = problems_scope ~= scope
+
+  if problems_scope == scope then
+    if problems_pane_is_open() then
+      M.refresh_problems()
+    end
+    return
+  end
+
+  problems_scope = scope
+  if problems_pane_is_open() then
+    M.refresh_problems()
+  end
+
+  if changed then
+    vim.notify("Problems scope: " .. (problems_scope == "open" and "all diagnostics" or "current file"))
+  end
+end
+
+function M.toggle_problems_scope()
+  M.set_problems_scope(problems_scope == "current" and "open" or "current")
+end
+
+function M.set_auto_problem_folds(enabled)
+  enabled = enabled ~= false
+  if auto_problem_folds == enabled then
+    return
+  end
+
+  auto_problem_folds = enabled
+  vim.notify("Problems auto folding: " .. (auto_problem_folds and "enabled" or "disabled"))
+
+  if auto_problem_folds and problems_pane_is_open() then
+    M.refresh_problems({ silent = true })
+  end
+end
+
+function M.toggle_auto_problem_folds()
+  M.set_auto_problem_folds(not auto_problem_folds)
 end
 
 function M.close()
+  pending_problems_focus = false
+  problems_loading = false
   close_trouble()
   close_terminal_windows()
   close_empty_problems_windows()
+  refresh_winbars()
 end
 
 function M.is_open()
@@ -455,18 +1466,120 @@ function M.setup()
     M.open_problems()
   end, {})
 
+  vim.api.nvim_create_user_command("ProblemsScope", function(opts)
+    M.set_problems_scope(opts.args)
+  end, {
+    nargs = 1,
+    complete = function()
+      return { "current", "open" }
+    end,
+  })
+
+  vim.api.nvim_create_user_command("ProblemsToggleScope", function()
+    M.toggle_problems_scope()
+  end, {})
+
+  vim.api.nvim_create_user_command("ProblemsToggleAutoFolds", function()
+    M.toggle_auto_problem_folds()
+  end, {})
+
+  vim.api.nvim_create_user_command("ProblemsRefreshOpenFiles", function()
+    M.refresh_open_file_diagnostics()
+  end, {})
+
   vim.api.nvim_create_user_command("BottomPaneClose", function()
     M.close()
   end, {})
 
   local group = vim.api.nvim_create_augroup("BottomPane", { clear = true })
+  vim.api.nvim_create_autocmd("WinClosed", {
+    group = group,
+    callback = function(args)
+      local win = tonumber(args.match)
+      if win == bottom_win then
+        problems_loading = false
+        clear_bottom_pane_window(win)
+      end
+    end,
+  })
+
+  vim.api.nvim_create_autocmd({ "BufDelete", "BufUnload", "BufWipeout" }, {
+    group = group,
+    callback = function(args)
+      local file = args.file
+      if (not file or file == "") and is_valid_buf(args.buf) then
+        file = vim.api.nvim_buf_get_name(args.buf)
+      end
+
+      pending_buffer_refreshes[args.buf] = nil
+      remove_buffer_diagnostics(args.buf, file)
+    end,
+  })
+
+  vim.api.nvim_create_autocmd({ "BufReadPost", "BufWritePost", "FileChangedShellPost" }, {
+    group = group,
+    callback = function(args)
+      if not problems_pane_is_open() then
+        return
+      end
+
+      schedule_buffer_diagnostic_reload(args.buf)
+    end,
+  })
+
+  vim.api.nvim_create_autocmd("User", {
+    group = group,
+    pattern = "ExternalFileAutoReload",
+    callback = function(args)
+      if not problems_pane_is_open() then
+        return
+      end
+
+      local buf = args.data and tonumber(args.data.bufnr)
+      if buf then
+        schedule_buffer_diagnostic_reload(buf)
+      end
+    end,
+  })
+
+  vim.api.nvim_create_autocmd({ "BufEnter", "WinEnter" }, {
+    group = group,
+    callback = function(args)
+      if vim.bo[args.buf].buftype ~= "" or vim.bo[args.buf].filetype == "trouble" then
+        return
+      end
+
+      vim.schedule(function()
+        if active_kind == "problems" then
+          refresh_problem_state_soon(100)
+        end
+      end)
+    end,
+  })
+
   vim.api.nvim_create_autocmd("User", {
     group = group,
     pattern = "CocDiagnosticChange",
     callback = function()
-      M.refresh_problems()
+      if not problems_pane_is_open() then
+        return
+      end
+
+      sync_cache_from_buffer_vars(false)
+      refresh_problem_state_soon(100)
     end,
   })
+
+  vim.api.nvim_create_autocmd("User", {
+    group = group,
+    pattern = "CocNvimInit",
+    callback = function()
+      if problems_pane_is_open() then
+        start_problem_diagnostics()
+      end
+    end,
+  })
+
 end
 
 return M

@@ -1,0 +1,65 @@
+{
+  "name": "local-diagnostics",
+  "version": "0.1.0",
+  "main": "index.js",
+  "engines": {
+    "coc": ">=0.0.82"
+  },
+  "activationEvents": [
+    "*"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "localDiagnostics.adapters",
+        "title": "Show local diagnostics adapter metadata"
+      },
+      {
+        "command": "localDiagnostics.status",
+        "title": "Show local diagnostics status"
+      },
+      {
+        "command": "localDiagnostics.clear",
+        "title": "Clear local diagnostics"
+      },
+      {
+        "command": "localDiagnostics.refreshOpen",
+        "title": "Refresh local diagnostics for open files"
+      },
+      {
+        "command": "localDiagnostics.refreshPyrightOpen",
+        "title": "Refresh Pyright diagnostics for open Python files"
+      }
+    ],
+    "configuration": {
+      "title": "Local Diagnostics",
+      "properties": {
+        "localDiagnostics.pyright.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable the local Pyright language-server diagnostics adapter."
+        },
+        "localDiagnostics.pyright.path": {
+          "type": "string",
+          "default": "",
+          "description": "Optional legacy path to a Pyright language server executable or JavaScript entrypoint. Defaults to the Pyright language server bundled with coc-pyright when available."
+        },
+        "localDiagnostics.pyright.langserverPath": {
+          "type": "string",
+          "default": "",
+          "description": "Optional path to pyright-langserver or langserver.index.js."
+        },
+        "localDiagnostics.pyright.timeoutMs": {
+          "type": "number",
+          "default": 20000,
+          "description": "Timeout in milliseconds for each local Pyright language-server diagnostic request."
+        },
+        "localDiagnostics.pyright.settleMs": {
+          "type": "number",
+          "default": 1500,
+          "description": "Delay in milliseconds after opening files in the local Pyright language server before pulling diagnostics."
+        }
+      }
+    }
+  }
+}

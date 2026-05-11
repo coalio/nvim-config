@@ -16,10 +16,24 @@ return {
     branch = "release",
     lazy = false,
     init = function()
+      local local_diagnostics_root = vim.fn.stdpath "config" .. "/coc-extensions/local-diagnostics"
+      local local_pyright_adapter_path = local_diagnostics_root .. "/adapters/pyright.js"
+      local local_pyright_diagnostics_enabled = vim.g.local_diagnostics_pyright_enabled ~= false
+        and vim.fn.filereadable(local_pyright_adapter_path) == 1
+
+      vim.opt.runtimepath:prepend(local_diagnostics_root)
+      vim.g.coc_user_config = vim.tbl_extend("force", vim.g.coc_user_config or {}, {
+        ["localDiagnostics.pyright.enabled"] = local_pyright_diagnostics_enabled,
+        ["pyright.disableDiagnostics"] = local_pyright_diagnostics_enabled,
+      })
       vim.g.coc_global_extensions = {
+        "coc-clangd",
         "coc-css",
+        "coc-eslint",
         "coc-html",
         "coc-json",
+        "coc-pyright",
+        "coc-tsserver",
       }
     end,
     config = function()
