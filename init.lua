@@ -56,6 +56,7 @@ if vim.g.neovide then
 
   vim.g.neovide_corner_preference = "round"
   vim.g.neovide_remember_window_size = true
+  vim.g.neovide_scale_factor = 0.9
 
   vim.keymap.set({ 'n', 'v', 'i' }, '<F11>', function()
     vim.g.neovide_fullscreen = not vim.g.neovide_fullscreen
