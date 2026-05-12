@@ -9,13 +9,13 @@ map("n", "<C-_>", "<cmd>Telescope current_buffer_fuzzy_find<CR>", { desc = "Find
 
 map("n", "<C-S-b>", "<cmd>NvimTreeToggle<CR>", { desc = "Toggle NvimTree" })
 
-map("n", "<leader>rm", function()
+map("n", "<leader>r", function()
   local api = require "nvim-tree.api"
   api.tree.find_file({ open = true, focus = true })
 end, { desc = "Reveal current file in NvimTree" })
 map("n", "<leader>f", function()
   require("configs.browser").browse_home()
-end, { desc = "Browse folder" })
+end, { desc = "Browse" })
 map("n", "<leader>nr", function()
   vim.opt.relativenumber = not vim.opt.relativenumber:get()
 end, { desc = "Toggle relative line numbers" })
@@ -27,6 +27,19 @@ end, { nargs = "*", complete = "shellcmd" })
 vim.api.nvim_create_user_command("Vterm", function(opts)
   _G.run_custom_term(opts.args, true)
 end, { nargs = "*", complete = "shellcmd" })
+
+map("n", "<C-j>", function()
+  require("configs.bottom_pane").toggle_terminal()
+end, { desc = "Toggle bottom pane terminal" })
+map("n", "<leader>pt", function()
+  require("configs.bottom_pane").open_terminal()
+end, { desc = "Bottom pane terminal" })
+map("n", "<leader>pp", function()
+  require("configs.bottom_pane").open_problems()
+end, { desc = "Bottom pane problems" })
+map("n", "<leader>pc", function()
+  require("configs.bottom_pane").close()
+end, { desc = "Close bottom pane" })
 
 vim.cmd [[
   cnoreabbrev <expr> term getcmdtype() == ":" && getcmdline() =~# '^term\>' ? 'Term' : 'term'
@@ -101,3 +114,9 @@ vim.cmd [[
   cabbrev <expr> qa <SID>CheckQuit('qa')
   cabbrev <expr> qw <SID>CheckQuit('qw')
 ]]
+
+if vim.g.neovide then
+    vim.keymap.set({ "n", "v" }, "<C-+>", ":lua vim.g.neovide_scale_factor = vim.g.neovide_scale_factor + 0.1<CR>")
+    vim.keymap.set({ "n", "v" }, "<C-->", ":lua vim.g.neovide_scale_factor = vim.g.neovide_scale_factor - 0.1<CR>")
+    vim.keymap.set({ "n", "v" }, "<C-0>", ":lua vim.g.neovide_scale_factor = 1<CR>")
+end

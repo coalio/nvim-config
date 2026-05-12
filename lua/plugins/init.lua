@@ -8,9 +8,41 @@ return {
   -- These are some examples, uncomment them if you want to see them work!
   {
     "neovim/nvim-lspconfig",
-    config = function()
-      require "configs.lspconfig"
+    enabled = false,
+  },
+
+  {
+    "neoclide/coc.nvim",
+    branch = "release",
+    lazy = false,
+    init = function()
+      vim.g.coc_global_extensions = {
+        "coc-css",
+        "coc-html",
+        "coc-json",
+      }
     end,
+    config = function()
+      require "configs.coc"
+    end,
+  },
+
+  {
+    "folke/trouble.nvim",
+    cmd = "Trouble",
+    dependencies = { "nvim-tree/nvim-web-devicons" },
+    opts = {
+      focus = true,
+      win = {
+        type = "split",
+        relative = "win",
+        position = "bottom",
+        size = 12,
+        wo = {
+          winfixbuf = true,
+        },
+      },
+    },
   },
 
   {
@@ -47,7 +79,7 @@ return {
     "folke/persistence.nvim",
     event = "BufReadPre",
     opts = {
-      options = { "buffers", "curdir", "folds", "help", "tabpages", "winsize", "winpos", "terminal", "localoptions" },
+      options = { "buffers", "curdir", "folds", "help", "tabpages", "winsize", "winpos", "localoptions" },
     },
   },
   {
@@ -105,7 +137,7 @@ return {
     "coalio/openclaude.nvim",
     dependencies = { "folke/snacks.nvim" },
     opts = {
-      terminal_cmd = "/home/coal/.local/bin/claude",
+      terminal_cmd = vim.fn.expand "~/.local/share/coals-neovide/node-v24.14.1-linux-x64/bin/openclaude",
     },
     config = true,
     keys = {
@@ -133,4 +165,3 @@ return {
 
   { "MunifTanjim/nui.nvim", lazy = false }
 }
-

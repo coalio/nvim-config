@@ -36,15 +36,31 @@ vim.schedule(function()
   require "mappings"
 end)
 
--- Only run this if Neovim is being launched by Neovide
 if vim.g.neovide then
-  -- Toggle fullscreen on F11 in Normal, Insert, and Visual modes
+  local function sync_neovide_titlebar()
+    local normal = vim.api.nvim_get_hl(0, { name = "Normal", link = false })
+
+    if normal.bg then
+      vim.g.neovide_title_background_color = string.format("#%06x", normal.bg)
+    end
+
+    if normal.fg then
+      vim.g.neovide_title_text_color = string.format("#%06x", normal.fg)
+    end
+  end
+
+  sync_neovide_titlebar()
+  vim.api.nvim_create_autocmd("ColorScheme", {
+    callback = sync_neovide_titlebar,
+  })
+
+  vim.g.neovide_corner_preference = "round"
+  vim.g.neovide_remember_window_size = true
+
   vim.keymap.set({ 'n', 'v', 'i' }, '<F11>', function()
     vim.g.neovide_fullscreen = not vim.g.neovide_fullscreen
   end, { desc = 'Toggle Neovide Fullscreen' })
-end
 
-if vim.g.neovide then
   -- Faster animation (default 0.13)
   vim.g.neovide_cursor_animation_length = 0.05
   
@@ -110,7 +126,11 @@ _G.smart_close = function(force)
   -- Neovim natively closes any split displaying a deleted buffer. 
   -- By sliding the alternate buffer into every window first, we completely decouple the UI.
   for _, win in ipairs(vim.api.nvim_list_wins()) do
-    if vim.api.nvim_win_is_valid(win) and vim.api.nvim_win_get_buf(win) == current_buf then
+    local fixed = vim.api.nvim_win_is_valid(win)
+      and vim.fn.exists("+winfixbuf") == 1
+      and vim.api.nvim_get_option_value("winfixbuf", { win = win })
+
+    if vim.api.nvim_win_is_valid(win) and not fixed and vim.api.nvim_win_get_buf(win) == current_buf then
       vim.api.nvim_win_set_buf(win, alt_buf)
     end
   end
@@ -146,6 +166,14 @@ end
 -- ==============================================================================
 
 _G.run_custom_term = function(args, vertical)
+  if not vertical then
+    local ok, bottom_pane = pcall(require, "configs.bottom_pane")
+    if ok then
+      bottom_pane.open_terminal(args)
+      return
+    end
+  end
+
   if vertical then
     vim.cmd("vsplit")
   else
@@ -167,6 +195,32 @@ _G.run_custom_term = function(args, vertical)
 
   vim.cmd("startinsert")
 end
+
+_G.run_buffer_command_in_target = function(cmd)
+  local ok, bottom_pane = pcall(require, "configs.bottom_pane")
+  if ok and bottom_pane.is_current_window_fixed and bottom_pane.is_current_window_fixed() then
+    if not bottom_pane.focus_buffer_target_window() then
+      return
+    end
+  end
+
+  vim.cmd(cmd)
+end
+
+local buffer_switch_commands = {
+  b = true,
+  buffer = true,
+  buf = true,
+  bn = true,
+  bnext = true,
+  bp = true,
+  bprev = true,
+  bprevious = true,
+  bNext = true,
+  bfirst = true,
+  brewind = true,
+  blast = true,
+}
 
 -- ==============================================================================
 -- 6. The Ultimate Command Interceptor
@@ -198,6 +252,12 @@ vim.keymap.set("c", "<CR>", function()
       elseif base == "vterm" then
         _G.pending_term_args = args or ""
         return "<C-c><Cmd>lua _G.run_custom_term(_G.pending_term_args, true)<CR>"
+      elseif buffer_switch_commands[base] then
+        local ok, bottom_pane = pcall(require, "configs.bottom_pane")
+        if ok and bottom_pane.is_current_window_fixed and bottom_pane.is_current_window_fixed() then
+          _G.pending_buffer_cmd = cmd
+          return "<C-c><Cmd>lua _G.run_buffer_command_in_target(_G.pending_buffer_cmd)<CR>"
+        end
       end
     end
   end
@@ -207,4 +267,3 @@ end, { expr = true, replace_keycodes = true, desc = "Intercept :q to keep layout
 -- Standard keybinds
 vim.keymap.set('n', '<F4>', function() _G.smart_close(false) end, { desc = 'Close buffer (with confirmation)' })
 vim.keymap.set('n', '<leader>q', function() _G.smart_close(false) end, { desc = 'Close buffer, keep window' })
-

@@ -1,4 +1,73 @@
 local M = {}
+local skip_next_persistence_tree_refresh = false
+
+local function close_bottom_pane()
+  local ok, bottom_pane = pcall(require, "configs.bottom_pane")
+  if ok then
+    bottom_pane.close()
+  end
+end
+
+local function wipe_terminal_buffers()
+  for _, buf in ipairs(vim.api.nvim_list_bufs()) do
+    if vim.api.nvim_buf_is_valid(buf) and vim.bo[buf].buftype == "terminal" then
+      vim.bo[buf].buflisted = false
+      pcall(vim.api.nvim_buf_delete, buf, { force = true })
+    end
+  end
+end
+
+local function unlock_current_window_for_replacement()
+  if vim.fn.exists("+winfixbuf") == 0 then
+    return
+  end
+
+  pcall(vim.api.nvim_set_option_value, "winfixbuf", false, { scope = "local", win = 0 })
+end
+
+local function focus_buffer_target_window()
+  local ok, bottom_pane = pcall(require, "configs.bottom_pane")
+  if ok and bottom_pane.focus_buffer_target_window and bottom_pane.focus_buffer_target_window() then
+    return true
+  end
+
+  for _, win in ipairs(vim.api.nvim_list_wins()) do
+    if vim.api.nvim_win_is_valid(win) then
+      local buf = vim.api.nvim_win_get_buf(win)
+      local fixed = vim.fn.exists("+winfixbuf") == 1 and vim.api.nvim_get_option_value("winfixbuf", { win = win })
+      if
+        not fixed
+        and vim.bo[buf].buftype == ""
+        and vim.bo[buf].filetype ~= "NvimTree"
+        and vim.bo[buf].filetype ~= "trouble"
+      then
+        vim.api.nvim_set_current_win(win)
+        return true
+      end
+    end
+  end
+
+  return false
+end
+
+local function prepare_workspace_replacement()
+  close_bottom_pane()
+  wipe_terminal_buffers()
+  if not focus_buffer_target_window() then
+    unlock_current_window_for_replacement()
+  end
+end
+
+local function prepare_file_edit()
+  if focus_buffer_target_window() then
+    return
+  end
+
+  close_bottom_pane()
+  if not focus_buffer_target_window() then
+    unlock_current_window_for_replacement()
+  end
+end
 
 local function close_alpha_buffer()
   local current = vim.api.nvim_get_current_buf()
@@ -20,7 +89,38 @@ local function normalize_dir(dir)
 end
 
 local function parent_dir(dir)
-  return vim.fn.fnamemodify(normalize_dir(dir), ":h")
+  local normalized = normalize_dir(dir)
+  local trimmed = normalized:gsub("[/\\]+$", "")
+
+  if trimmed == "" then
+    return normalized
+  end
+
+  return vim.fn.fnamemodify(trimmed, ":h")
+end
+
+local function session_file_exists()
+  local persistence = require "persistence"
+  local current = persistence.current()
+  if vim.fn.filereadable(current) == 1 then
+    return true
+  end
+
+  local fallback = persistence.current({ branch = false })
+  return vim.fn.filereadable(fallback) == 1
+end
+
+local function reset_workspace_buffers()
+  prepare_workspace_replacement()
+
+  for _, buf in ipairs(vim.api.nvim_list_bufs()) do
+    if vim.api.nvim_buf_is_valid(buf) and vim.bo[buf].buflisted then
+      pcall(vim.api.nvim_buf_delete, buf, { force = true })
+    end
+  end
+
+  prepare_file_edit()
+  pcall(vim.cmd, "enew")
 end
 
 local function scandir(dir)
@@ -80,10 +180,31 @@ local function set_workspace(dir, opts)
   vim.cmd("cd " .. vim.fn.fnameescape(dir))
   close_alpha_buffer()
 
-  if opts.load_session then
+  if opts.reset_buffers then
+    reset_workspace_buffers()
+  elseif opts.load_session then
+    prepare_workspace_replacement()
+  else
+    prepare_file_edit()
+  end
+
+  local loaded_session = false
+  if opts.load_session and session_file_exists() then
+    prepare_workspace_replacement()
     pcall(function()
+      skip_next_persistence_tree_refresh = true
       require("persistence").load()
+      loaded_session = true
     end)
+
+    if not loaded_session then
+      skip_next_persistence_tree_refresh = false
+    end
+  end
+
+  if opts.load_session and not loaded_session and vim.fn.bufname() ~= "" then
+    prepare_file_edit()
+    pcall(vim.cmd, "enew")
   end
 
   local ok, api = pcall(require, "nvim-tree.api")
@@ -102,7 +223,7 @@ local function set_workspace(dir, opts)
     end
   end
 
-  return dir
+  return dir, loaded_session
 end
 
 local function repo_root(path)
@@ -174,12 +295,21 @@ local function open_project_picker()
   }):find()
 end
 
+function M.consume_persistence_tree_refresh_skip()
+  if not skip_next_persistence_tree_refresh then
+    return false
+  end
+
+  skip_next_persistence_tree_refresh = false
+  return true
+end
+
 function M.set_workspace(dir, opts)
   return set_workspace(dir, opts)
 end
 
 function M.load_session(dir)
-  return set_workspace(dir, { load_session = true })
+  return set_workspace(dir, { load_session = true, reset_buffers = true })
 end
 
 function M.open_recent_projects()
@@ -240,6 +370,7 @@ function M.open(dir)
           else
             local workspace = repo_root(entry.path) or vim.fn.fnamemodify(entry.path, ":h")
             set_workspace(workspace)
+            prepare_file_edit()
             vim.cmd("edit " .. vim.fn.fnameescape(entry.path))
           end
         end)
@@ -248,14 +379,7 @@ function M.open(dir)
       local function open_current_folder()
         actions.close(prompt_bufnr)
         vim.schedule(function()
-          set_workspace(dir, { load_session = true, open_tree = true, focus_tree = true })
-        end)
-      end
-
-      local function go_parent()
-        actions.close(prompt_bufnr)
-        vim.schedule(function()
-          open_browser(parent_dir(dir))
+          set_workspace(dir, { load_session = true, reset_buffers = true, open_tree = true, focus_tree = true })
         end)
       end
 
@@ -264,10 +388,6 @@ function M.open(dir)
       map("n", "<CR>", edit_or_enter)
       map("i", "<C-o>", open_current_folder)
       map("n", "<C-o>", open_current_folder)
-      map("i", "<BS>", go_parent)
-      map("n", "<BS>", go_parent)
-      map("i", "<C-h>", go_parent)
-      map("n", "<C-h>", go_parent)
       return true
     end,
   }):find()

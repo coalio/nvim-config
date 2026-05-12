@@ -2,6 +2,22 @@ require "nvchad.autocmds"
 
 local autocmd = vim.api.nvim_create_autocmd
 
+local function wipe_terminal_buffers()
+  for _, buf in ipairs(vim.api.nvim_list_bufs()) do
+    if vim.api.nvim_buf_is_valid(buf) and vim.bo[buf].buftype == "terminal" then
+      vim.bo[buf].buflisted = false
+      pcall(vim.api.nvim_buf_delete, buf, { force = true })
+    end
+  end
+end
+
+local function close_bottom_pane()
+  local ok, bottom_pane = pcall(require, "configs.bottom_pane")
+  if ok then
+    bottom_pane.close()
+  end
+end
+
 pcall(vim.api.nvim_del_augroup_by_name, "nvchad_dashboard")
 
 autocmd("BufReadPost", {
@@ -49,6 +65,9 @@ autocmd("VimEnter", {
 autocmd("User", {
   pattern = "PersistenceSavePre",
   callback = function()
+    close_bottom_pane()
+    wipe_terminal_buffers()
+
     local ok, api = pcall(require, "nvim-tree.api")
     if ok and api.tree.is_visible() then
       api.tree.close()
@@ -56,9 +75,33 @@ autocmd("User", {
   end,
 })
 
+autocmd("User", {
+  pattern = "PersistenceLoadPost",
+  callback = function()
+    vim.schedule(function()
+      local browser = package.loaded["configs.browser"]
+      if browser and browser.consume_persistence_tree_refresh_skip and browser.consume_persistence_tree_refresh_skip() then
+        return
+      end
+
+      close_bottom_pane()
+      wipe_terminal_buffers()
+
+      local ok, api = pcall(require, "nvim-tree.api")
+      if ok then
+        if not api.tree.is_visible() then
+          api.tree.open()
+        end
+        api.tree.change_root(vim.fn.getcwd())
+      end
+    end)
+  end,
+})
+
 autocmd("TermOpen", {
   pattern = "*",
-  callback = function()
+  callback = function(args)
+    vim.bo[args.buf].buflisted = false
     vim.cmd "startinsert"
   end,
 })
