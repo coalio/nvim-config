@@ -46,6 +46,7 @@ return {
     cmd = "Trouble",
     dependencies = { "nvim-tree/nvim-web-devicons" },
     opts = {
+      auto_preview = false,
       focus = true,
       win = {
         type = "split",

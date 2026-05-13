@@ -1091,6 +1091,7 @@ local function open_trouble_problems(focus)
   local anchor_win = find_editor_window() or previous_win
   local view = trouble.open {
     mode = "qflist",
+    auto_preview = false,
     focus = focus ~= false,
     refresh = true,
     win = {
