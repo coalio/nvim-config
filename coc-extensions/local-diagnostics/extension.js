@@ -20,6 +20,7 @@ function createExtension() {
   let store;
   let processPool;
   let adapters;
+  let refreshEpoch = 0;
 
   function log(message) {
     if (!channel) {
@@ -45,21 +46,38 @@ function createExtension() {
     };
   }
 
+  async function notifyRefreshComplete(epoch) {
+    try {
+      if (workspace.nvim && typeof workspace.nvim.command === "function") {
+        await workspace.nvim.command(`let g:local_diagnostics_refresh_epoch = ${Number(epoch) || 0}`);
+        await workspace.nvim.command("doautocmd <nomodeline> User LocalDiagnosticsRefresh");
+      }
+    } catch (error) {
+      log(`could not notify local diagnostics refresh completion: ${error.message || String(error)}`);
+    }
+  }
+
   async function refreshOpen(optsInput = {}) {
     const opts = optsInput && typeof optsInput === "object" ? optsInput : {};
+    const epoch = refreshEpoch;
+    const refreshOpts = Object.assign({}, opts, { refreshEpoch: epoch });
     const adapterNames = Array.isArray(opts.adapters) && opts.adapters.length > 0 ? opts.adapters : Array.from(adapters.keys());
     const results = [];
 
-    for (const adapterName of adapterNames) {
-      const adapter = adapters.get(adapterName);
-      if (!adapter) {
-        results.push(fail(`unknown adapter: ${adapterName}`, { adapter: adapterName }));
-        continue;
-      }
+    try {
+      for (const adapterName of adapterNames) {
+        const adapter = adapters.get(adapterName);
+        if (!adapter) {
+          results.push(fail(`unknown adapter: ${adapterName}`, { adapter: adapterName }));
+          continue;
+        }
 
-      results.push(await adapter.refreshOpen(opts[adapterName] || opts));
+        results.push(await adapter.refreshOpen(Object.assign({}, refreshOpts, opts[adapterName] || {})));
+      }
+      return ok({ results, lastUpdate: store.status().lastUpdate });
+    } finally {
+      await notifyRefreshComplete(epoch);
     }
-    return ok({ results, lastUpdate: store.status().lastUpdate });
   }
 
   function adapterMetadata() {
@@ -81,6 +99,7 @@ function createExtension() {
         "pyright",
         createPyrightAdapter({
           log,
+          isRefreshCurrent: (epoch) => epoch === refreshEpoch,
           processPool,
           store,
           uriTools,
@@ -92,7 +111,10 @@ function createExtension() {
     context.subscriptions.push(channel, collection);
     context.subscriptions.push(commands.registerCommand(`${COMMAND_PREFIX}.ping`, () => ok({ name: EXTENSION_NAME })));
     context.subscriptions.push(commands.registerCommand(`${COMMAND_PREFIX}.set`, command((uri, diagnostics, opts) => ok(store.set(uri, diagnostics, opts)))));
-    context.subscriptions.push(commands.registerCommand(`${COMMAND_PREFIX}.clear`, command((uri, opts) => ok(store.clear(uri, opts)))));
+    context.subscriptions.push(commands.registerCommand(`${COMMAND_PREFIX}.clear`, command((uri, opts) => {
+      refreshEpoch += 1;
+      return ok(store.clear(uri, opts));
+    })));
     context.subscriptions.push(commands.registerCommand(`${COMMAND_PREFIX}.status`, () => ok(Object.assign({ name: EXTENSION_NAME, registeredAdapters: adapterMetadata() }, store.status()))));
     context.subscriptions.push(commands.registerCommand(`${COMMAND_PREFIX}.adapters`, () => ok({ adapters: adapterMetadata() })));
     context.subscriptions.push(commands.registerCommand(`${COMMAND_PREFIX}.refreshOpen`, command(refreshOpen)));

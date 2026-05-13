@@ -414,7 +414,7 @@ function applyAdapterDiagnostics(store, requestedUris, grouped) {
   return diagnostics;
 }
 
-function createPyrightAdapter({ workspace, store, uriTools, log }) {
+function createPyrightAdapter({ workspace, store, uriTools, log, isRefreshCurrent }) {
   let nextRunId = 0;
 
   async function refreshOpen(optsInput = {}) {
@@ -441,7 +441,14 @@ function createPyrightAdapter({ workspace, store, uriTools, log }) {
     log(`running ${ADAPTER_NAME} LSP diagnostics for ${files.length} listed buffer(s): ${executable.display}`);
     const grouped = await collectDiagnosticsWithLsp(workspace, uriTools, targets, executable, opts, log);
 
-    if (runId !== nextRunId) {
+    if (
+      runId !== nextRunId
+      || (
+        opts.refreshEpoch !== undefined
+        && typeof isRefreshCurrent === "function"
+        && !isRefreshCurrent(opts.refreshEpoch)
+      )
+    ) {
       return { ok: true, adapter: ADAPTER_NAME, stale: true };
     }
 

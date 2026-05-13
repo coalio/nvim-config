@@ -1,6 +1,13 @@
 local M = {}
 local skip_next_persistence_tree_refresh = false
 
+local function reset_bottom_pane_diagnostics()
+  local ok, bottom_pane = pcall(require, "configs.bottom_pane")
+  if ok and type(bottom_pane.reset_diagnostics) == "function" then
+    bottom_pane.reset_diagnostics()
+  end
+end
+
 local function close_bottom_pane()
   local ok, bottom_pane = pcall(require, "configs.bottom_pane")
   if ok then
@@ -176,6 +183,11 @@ end
 local function set_workspace(dir, opts)
   opts = opts or {}
   dir = normalize_dir(dir)
+  local previous_dir = normalize_dir(vim.loop.cwd())
+
+  if previous_dir ~= dir then
+    reset_bottom_pane_diagnostics()
+  end
 
   vim.cmd("cd " .. vim.fn.fnameescape(dir))
   close_alpha_buffer()

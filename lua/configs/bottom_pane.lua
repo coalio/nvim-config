@@ -5,8 +5,10 @@ local terminal_buf
 local terminal_chan
 local problem_count = 0
 local problems_loading = false
-local diagnostics_loading_until = 0
-local diagnostics_loading_duration_ns = 4000000000
+local diagnostics_response_received = false
+local waiting_for_local_diagnostics = false
+local local_diagnostics_epoch = 0
+local waiting_for_local_diagnostics_epoch
 local empty_problems_buf
 local winbar_marker = "NvChadBottomPane"
 local bottom_win
@@ -25,6 +27,23 @@ local reading_coc_diagnostics = false
 local last_diagnostic_list_ns = 0
 local last_diagnostic_list_result
 local pending_problems_focus = false
+
+local function note_diagnostic_response()
+  diagnostics_response_received = true
+end
+
+local function stop_timer(timer)
+  if not timer then
+    return
+  end
+
+  pcall(function()
+    if not timer:is_closing() then
+      timer:stop()
+      timer:close()
+    end
+  end)
+end
 
 local function is_valid_win(win)
   return win and vim.api.nvim_win_is_valid(win)
@@ -438,10 +457,6 @@ local function set_empty_problems_content(kind)
   local lines
 
   if kind == "loading" then
-    if not problems_loading then
-      local uv = vim.uv or vim.loop
-      diagnostics_loading_until = uv and (uv.hrtime() + diagnostics_loading_duration_ns) or 0
-    end
     problems_loading = true
     problem_count = 0
     lines = {
@@ -451,7 +466,6 @@ local function set_empty_problems_content(kind)
     }
   else
     problems_loading = false
-    diagnostics_loading_until = 0
     problem_count = 0
     lines = {
       "No problems.",
@@ -922,6 +936,10 @@ local function set_qflist_from_diagnostics(diagnostics)
     items = items,
   })
 
+  if #items > 0 then
+    note_diagnostic_response()
+  end
+
   problem_count = #items
   refresh_winbars()
   last_diagnostic_list_result = #items > 0
@@ -1051,7 +1069,7 @@ local function request_local_diagnostic_refresh()
   if uv then
     local now = uv.hrtime()
     if local_diagnostic_refresh_requested_until > now then
-      return true
+      return waiting_for_local_diagnostics
     end
     local_diagnostic_refresh_requested_until = now + 2000000000
   end
@@ -1061,7 +1079,13 @@ local function request_local_diagnostic_refresh()
     return false
   end
 
-  return local_diagnostics.refresh_open()
+  local ok = local_diagnostics.refresh_open()
+  if ok then
+    waiting_for_local_diagnostics = true
+    waiting_for_local_diagnostics_epoch = local_diagnostics_epoch
+  end
+
+  return ok
 end
 
 local function clear_local_diagnostics_for_file(file)
@@ -1075,6 +1099,16 @@ local function clear_local_diagnostics_for_file(file)
   end
 
   pcall(local_diagnostics.clear, file)
+end
+
+local function clear_all_local_diagnostics()
+  local ok, local_diagnostics = pcall(require, "configs.local_diagnostics")
+  if not ok or type(local_diagnostics.clear) ~= "function" then
+    return false
+  end
+
+  local ok_clear, result = pcall(local_diagnostics.clear)
+  return ok_clear and type(result) == "table"
 end
 
 local function remove_buffer_diagnostics(buf, file)
@@ -1155,11 +1189,6 @@ function M.refresh_open_file_diagnostics()
     return false
   end
 
-  local uv = vim.uv or vim.loop
-  if uv then
-    diagnostics_loading_until = uv.hrtime() + diagnostics_loading_duration_ns
-  end
-
   if not coc_ready() then
     return false
   end
@@ -1182,6 +1211,9 @@ local function start_problem_diagnostics(delay, attempts, opts)
 
   if not opts.background then
     problems_loading = true
+    diagnostics_response_received = false
+    waiting_for_local_diagnostics = false
+    waiting_for_local_diagnostics_epoch = nil
     refresh_winbars("problems")
   end
 
@@ -1346,7 +1378,9 @@ local function open_cached_problems(focus)
 
   pending_problems_focus = focus ~= false
   problems_loading = false
-  diagnostics_loading_until = 0
+  diagnostics_response_received = true
+  waiting_for_local_diagnostics = false
+  waiting_for_local_diagnostics_epoch = nil
   close_empty_problems_windows()
 
   if not open_trouble_problems(focus) then
@@ -1373,7 +1407,9 @@ local function open_cached_qflist_problems(focus)
 
   pending_problems_focus = focus ~= false
   problems_loading = false
-  diagnostics_loading_until = 0
+  diagnostics_response_received = true
+  waiting_for_local_diagnostics = false
+  waiting_for_local_diagnostics_epoch = nil
   problem_count = tonumber(info.size) or problem_count
   close_empty_problems_windows()
 
@@ -1404,7 +1440,7 @@ function M.open_problems()
     return
   end
 
-  if last_diagnostic_list_ns > 0 and last_diagnostic_list_result == false then
+  if diagnostics_response_received and last_diagnostic_list_ns > 0 and last_diagnostic_list_result == false then
     open_empty_problems(true, "empty")
     start_problem_diagnostics(0, 0, { background = true })
     return
@@ -1439,7 +1475,9 @@ function M.refresh_problems(opts)
   if has_items then
     pending_problems_focus = false
     problems_loading = false
-    diagnostics_loading_until = 0
+    diagnostics_response_received = true
+    waiting_for_local_diagnostics = false
+    waiting_for_local_diagnostics_epoch = nil
 
     if ok and trouble.is_open "qflist" then
       open_trouble_problems(focus_problems)
@@ -1461,15 +1499,15 @@ function M.refresh_problems(opts)
     return
   end
 
-  local uv = vim.uv or vim.loop
-  if problems_loading and uv and diagnostics_loading_until > uv.hrtime() then
+  if problems_loading and (waiting_for_local_diagnostics or not diagnostics_response_received) then
     open_empty_problems(focus_problems, "loading")
     return
   end
 
   pending_problems_focus = false
   problems_loading = false
-  diagnostics_loading_until = 0
+  waiting_for_local_diagnostics = false
+  waiting_for_local_diagnostics_epoch = nil
 
   if ok and trouble.is_open "qflist" then
     close_trouble()
@@ -1528,9 +1566,45 @@ end
 function M.close()
   pending_problems_focus = false
   problems_loading = false
+  waiting_for_local_diagnostics = false
+  waiting_for_local_diagnostics_epoch = nil
   close_trouble()
   close_terminal_windows()
   close_empty_problems_windows()
+  refresh_winbars()
+end
+
+function M.reset_diagnostics()
+  pending_problem_poll_generation = pending_problem_poll_generation + 1
+  stop_timer(pending_problem_refresh)
+  pending_problem_refresh = nil
+
+  for buf, timer in pairs(pending_buffer_refreshes) do
+    stop_timer(timer)
+    pending_buffer_refreshes[buf] = nil
+  end
+
+  diagnostic_cache = {}
+  problem_count = 0
+  problems_loading = false
+  diagnostics_response_received = false
+  waiting_for_local_diagnostics = false
+  waiting_for_local_diagnostics_epoch = nil
+  pending_problems_focus = false
+  diagnostic_refresh_requested_until = 0
+  local_diagnostic_refresh_requested_until = 0
+  reading_coc_diagnostics = false
+  last_diagnostic_list_ns = 0
+  last_diagnostic_list_result = nil
+
+  vim.fn.setqflist({}, "r", {
+    title = "CoC Problems",
+    items = {},
+  })
+
+  if clear_all_local_diagnostics() then
+    local_diagnostics_epoch = local_diagnostics_epoch + 1
+  end
   refresh_winbars()
 end
 
@@ -1636,6 +1710,8 @@ function M.setup()
       local win = tonumber(args.match)
       if win == bottom_win then
         problems_loading = false
+        waiting_for_local_diagnostics = false
+        waiting_for_local_diagnostics_epoch = nil
         clear_bottom_pane_window(win)
       end
     end,
@@ -1703,8 +1779,31 @@ function M.setup()
         return
       end
 
+      note_diagnostic_response()
       sync_cache_from_buffer_vars(false)
       refresh_problem_state_soon(100)
+    end,
+  })
+
+  vim.api.nvim_create_autocmd("User", {
+    group = group,
+    pattern = "LocalDiagnosticsRefresh",
+    callback = function()
+      local epoch = tonumber(vim.g.local_diagnostics_refresh_epoch)
+      if waiting_for_local_diagnostics_epoch and epoch and epoch < waiting_for_local_diagnostics_epoch then
+        return
+      end
+
+      waiting_for_local_diagnostics = false
+      waiting_for_local_diagnostics_epoch = nil
+      note_diagnostic_response()
+
+      if not problems_pane_is_open() then
+        return
+      end
+
+      sync_cache_from_buffer_vars(false)
+      refresh_problem_state_soon(50)
     end,
   })
 
