@@ -272,6 +272,33 @@ local function current_window_is_problems_pane()
   return buf == empty_problems_buf or vim.bo[buf].filetype == "trouble"
 end
 
+local function configure_problem_window(win)
+  if not is_valid_win(win) then
+    return
+  end
+
+  for option, value in pairs {
+    breakindent = false,
+    linebreak = false,
+    smoothscroll = false,
+    wrap = false,
+  } do
+    pcall(vim.api.nvim_set_option_value, option, value, { scope = "local", win = win })
+  end
+end
+
+local function scroll_window_horizontally(win, columns)
+  if not is_valid_win(win) then
+    return
+  end
+
+  vim.api.nvim_win_call(win, function()
+    local view = vim.fn.winsaveview()
+    view.leftcol = math.max(0, (tonumber(view.leftcol) or 0) + columns)
+    vim.fn.winrestview(view)
+  end)
+end
+
 local function refresh_winbars(active)
   active = active or active_kind
 
@@ -287,10 +314,12 @@ local function refresh_winbars(active)
     elseif buf == empty_problems_buf or (kind == "problems" and vim.bo[buf].filetype == "trouble") then
       kind = "problems"
       lock_window_to_buffer(win)
+      configure_problem_window(win)
       mark_bottom_pane_window(win, kind)
       set_winbar(win, active == kind and kind or nil)
     elseif kind == "problems" and vim.bo[buf].buftype == "quickfix" then
       lock_window_to_buffer(win)
+      configure_problem_window(win)
       set_winbar(win, active == kind and kind or nil)
     else
       clear_bottom_pane_winbar(win)
@@ -1093,6 +1122,7 @@ local function open_trouble_problems(focus)
     mode = "qflist",
     auto_preview = false,
     focus = focus ~= false,
+    multiline = false,
     refresh = true,
     win = {
       type = "split",
@@ -1102,6 +1132,7 @@ local function open_trouble_problems(focus)
       win = anchor_win,
       wo = {
         winfixbuf = true,
+        wrap = false,
       },
     },
   }
@@ -1150,6 +1181,19 @@ local function open_trouble_problems(focus)
         del = severity == 0,
       })
     end, { buffer = buf, nowait = true, desc = "Problems: cycle severity filter" })
+
+    local function map_horizontal_scroll(lhs, columns, desc)
+      vim.keymap.set("n", lhs, function()
+        local current_win = vim.api.nvim_get_current_win()
+        local target_win = current_window_is_problems_pane() and current_win or win
+        scroll_window_horizontally(target_win, columns)
+      end, { buffer = buf, nowait = true, desc = desc })
+    end
+
+    map_horizontal_scroll("<S-ScrollWheelUp>", -16, "Problems: scroll left")
+    map_horizontal_scroll("<S-ScrollWheelDown>", 16, "Problems: scroll right")
+    map_horizontal_scroll("<ScrollWheelLeft>", -16, "Problems: scroll left")
+    map_horizontal_scroll("<ScrollWheelRight>", 16, "Problems: scroll right")
   end
 
   local function apply_trouble_winbar()
@@ -1157,6 +1201,7 @@ local function open_trouble_problems(focus)
     if is_valid_win(win) then
       mark_bottom_pane_window(win, "problems")
       lock_window_to_buffer(win)
+      configure_problem_window(win)
       set_winbar(win, "problems")
       document_trouble_keymaps(win)
     end

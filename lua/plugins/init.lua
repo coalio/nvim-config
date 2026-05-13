@@ -48,6 +48,7 @@ return {
     opts = {
       auto_preview = false,
       focus = true,
+      multiline = false,
       win = {
         type = "split",
         relative = "win",
@@ -55,6 +56,7 @@ return {
         size = 12,
         wo = {
           winfixbuf = true,
+          wrap = false,
         },
       },
     },
