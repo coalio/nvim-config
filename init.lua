@@ -1,6 +1,23 @@
 vim.g.base46_cache = vim.fn.stdpath "data" .. "/base46/"
 vim.g.mapleader = "\\"
 
+-- nvim-treesitter main uses vim.list.unique, which is not available on this
+-- Neovim build yet.
+vim.list = vim.list or {}
+vim.list.unique = vim.list.unique or function(items)
+  local seen = {}
+  local ret = {}
+
+  for _, item in ipairs(items) do
+    if not seen[item] then
+      seen[item] = true
+      table.insert(ret, item)
+    end
+  end
+
+  return ret
+end
+
 -- bootstrap lazy and all plugins
 local lazypath = vim.fn.stdpath "data" .. "/lazy/lazy.nvim"
 
