@@ -48,6 +48,7 @@ dofile(vim.g.base46_cache .. "statusline")
 
 require "options"
 require "autocmds"
+require("configs.editor_scrolling").setup()
 require("configs.auto_reload").setup()
 
 vim.schedule(function()
