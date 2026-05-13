@@ -287,15 +287,45 @@ local function configure_problem_window(win)
   end
 end
 
+local function get_problem_window_option(win, option, fallback)
+  local ok, value = pcall(vim.api.nvim_get_option_value, option, { scope = "local", win = win })
+  return ok and value or fallback
+end
+
+local function set_problem_window_option(win, option, value)
+  pcall(vim.api.nvim_set_option_value, option, value, { scope = "local", win = win })
+end
+
+local function set_problem_virtualedit_for_scroll(win, enabled)
+  if enabled then
+    if not vim.w[win].bottom_pane_previous_virtualedit then
+      vim.w[win].bottom_pane_previous_virtualedit = get_problem_window_option(win, "virtualedit", "")
+    end
+
+    set_problem_window_option(win, "virtualedit", "all")
+    return
+  end
+
+  local previous = vim.w[win].bottom_pane_previous_virtualedit
+  if previous ~= nil then
+    set_problem_window_option(win, "virtualedit", previous == "" and "none" or previous)
+    vim.w[win].bottom_pane_previous_virtualedit = nil
+  end
+end
+
 local function window_text_width(win)
   return math.max(1, vim.api.nvim_win_get_width(win) - (tonumber(vim.wo[win].sidescrolloff) or 0))
+end
+
+local function line_end_virtual_column(lnum)
+  return math.max(1, (tonumber(vim.fn.virtcol({ lnum, "$" })) or 1) - 1)
 end
 
 local function current_buffer_widest_line()
   local widest = 1
 
   for lnum = 1, vim.api.nvim_buf_line_count(0) do
-    local width = math.max(1, (tonumber(vim.fn.virtcol({ lnum, "$" })) or 1) - 1)
+    local width = line_end_virtual_column(lnum)
     if width > widest then
       widest = width
     end
@@ -308,6 +338,45 @@ local function max_window_leftcol(win)
   return math.max(0, current_buffer_widest_line() - window_text_width(win))
 end
 
+local function cursor_for_problem_virtual_column(win, lnum, virtual_column)
+  virtual_column = math.max(1, math.floor(virtual_column))
+
+  local byte_column = tonumber(vim.fn.virtcol2col(win, lnum, virtual_column)) or 0
+  if byte_column < 1 then
+    return 1, virtual_column - 1, virtual_column - 1
+  end
+
+  local actual_virtual_column = tonumber(vim.fn.virtcol({ lnum, byte_column })) or virtual_column
+  local coladd = math.max(0, virtual_column - actual_virtual_column)
+  return byte_column, coladd, virtual_column - 1
+end
+
+local function drag_problem_cursor_into_view(win, view, target_leftcol)
+  local width = window_text_width(win)
+  local margin = math.min(tonumber(vim.wo[win].sidescrolloff) or 0, math.floor(width / 3))
+  local left_bound = target_leftcol + margin + 1
+  local right_bound = math.max(left_bound, target_leftcol + width - margin)
+  local cursor_virtual_column = tonumber(vim.fn.virtcol ".") or 1
+  local target_virtual_column
+
+  if cursor_virtual_column < left_bound then
+    target_virtual_column = left_bound
+  elseif cursor_virtual_column > right_bound then
+    target_virtual_column = target_leftcol == 0 and math.min(right_bound, line_end_virtual_column(vim.fn.line ".")) or right_bound
+  else
+    return
+  end
+
+  local lnum = vim.fn.line "."
+  local byte_column, coladd, curswant = cursor_for_problem_virtual_column(win, lnum, target_virtual_column)
+  set_problem_virtualedit_for_scroll(win, coladd > 0)
+
+  view.lnum = lnum
+  view.col = byte_column - 1
+  view.coladd = coladd
+  view.curswant = curswant
+end
+
 local function scroll_window_horizontally(win, columns)
   if not is_valid_win(win) then
     return
@@ -315,7 +384,9 @@ local function scroll_window_horizontally(win, columns)
 
   vim.api.nvim_win_call(win, function()
     local view = vim.fn.winsaveview()
-    view.leftcol = math.min(max_window_leftcol(win), math.max(0, (tonumber(view.leftcol) or 0) + columns))
+    local target_leftcol = math.min(max_window_leftcol(win), math.max(0, (tonumber(view.leftcol) or 0) + columns))
+    drag_problem_cursor_into_view(win, view, target_leftcol)
+    view.leftcol = target_leftcol
     vim.fn.winrestview(view)
   end)
 end
