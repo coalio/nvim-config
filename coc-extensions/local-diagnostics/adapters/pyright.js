@@ -5,6 +5,7 @@ const os = require("node:os");
 const path = require("node:path");
 
 const { LspClient } = require("../lsp_client");
+const { createPythonProcessEnv, resolvePythonEnvironment } = require("./python_env");
 
 const ADAPTER_NAME = "pyright";
 const ADAPTER_SOURCE = "local:pyright";
@@ -187,11 +188,26 @@ function analysisSettings(workspace) {
   };
 }
 
-function pythonSettings(workspace) {
-  return {
-    pythonPath: configValue(workspace, "python", "pythonPath", "python"),
+function pythonSettings(workspace, pythonEnvironment) {
+  const settings = {
+    pythonPath: pythonEnvironment && pythonEnvironment.pythonPath
+      ? pythonEnvironment.pythonPath
+      : configValue(workspace, "python", "pythonPath", "python"),
     analysis: analysisSettings(workspace),
   };
+
+  const configuredVenvPath = configValue(workspace, "python", "venvPath", "");
+  if (pythonEnvironment && pythonEnvironment.venvPath) {
+    settings.venvPath = pythonEnvironment.venvPath;
+  } else if (typeof configuredVenvPath === "string" && configuredVenvPath.trim() !== "") {
+    settings.venvPath = configuredVenvPath.trim();
+  }
+
+  if (pythonEnvironment && pythonEnvironment.venv) {
+    settings.venv = pythonEnvironment.venv;
+  }
+
+  return settings;
 }
 
 function pyrightSettings(workspace) {
@@ -276,16 +292,30 @@ async function collectDiagnosticsWithLsp(workspace, uriTools, targets, executabl
   const root = workspaceRoot(workspace, uriTools);
   const timeoutMs = diagnosticTimeout(workspace, opts);
   const settleMs = diagnosticSettleMs(workspace, opts);
+  const targetFiles = Array.from(targets.values());
+  const pythonEnvironment = resolvePythonEnvironment({
+    configValue,
+    opts,
+    root,
+    targetFiles,
+    workspace,
+  });
   const grouped = new Map();
+
+  if (pythonEnvironment && pythonEnvironment.pythonPath) {
+    log(`${ADAPTER_NAME} using Python from ${pythonEnvironment.pythonPath} (${pythonEnvironment.source})`);
+  }
+
   const client = new LspClient(executable.command, executable.argsPrefix, {
     cwd: root,
+    env: createPythonProcessEnv(process.env, pythonEnvironment),
     log: (message) => log(`${ADAPTER_NAME} language server: ${message}`),
     onRequest(method, params) {
       if (method === "workspace/configuration") {
         const items = Array.isArray(params && params.items) ? params.items : [];
         return items.map((item) => {
           if (!item || item.section === "python") {
-            return pythonSettings(workspace);
+            return pythonSettings(workspace, pythonEnvironment);
           }
 
           if (item.section === "python.analysis") {

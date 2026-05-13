@@ -49,6 +49,24 @@
           "default": "",
           "description": "Optional path to pyright-langserver or langserver.index.js."
         },
+        "localDiagnostics.pyright.pythonPath": {
+          "type": "string",
+          "default": "",
+          "description": "Optional explicit Python executable for the local Pyright adapter. When empty, the adapter discovers project virtual environments by default."
+        },
+        "localDiagnostics.pyright.discoverVenv": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically discover and use a project virtual environment for local Pyright diagnostics."
+        },
+        "localDiagnostics.pyright.venvNames": {
+          "type": "array",
+          "default": [".venv", "venv", "env", ".env"],
+          "description": "Virtual environment directory names to look for when local Pyright venv discovery is enabled.",
+          "items": {
+            "type": "string"
+          }
+        },
         "localDiagnostics.pyright.timeoutMs": {
           "type": "number",
           "default": 20000,
