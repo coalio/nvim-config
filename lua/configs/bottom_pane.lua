@@ -287,6 +287,27 @@ local function configure_problem_window(win)
   end
 end
 
+local function window_text_width(win)
+  return math.max(1, vim.api.nvim_win_get_width(win) - (tonumber(vim.wo[win].sidescrolloff) or 0))
+end
+
+local function current_buffer_widest_line()
+  local widest = 1
+
+  for lnum = 1, vim.api.nvim_buf_line_count(0) do
+    local width = math.max(1, (tonumber(vim.fn.virtcol({ lnum, "$" })) or 1) - 1)
+    if width > widest then
+      widest = width
+    end
+  end
+
+  return widest
+end
+
+local function max_window_leftcol(win)
+  return math.max(0, current_buffer_widest_line() - window_text_width(win))
+end
+
 local function scroll_window_horizontally(win, columns)
   if not is_valid_win(win) then
     return
@@ -294,7 +315,7 @@ local function scroll_window_horizontally(win, columns)
 
   vim.api.nvim_win_call(win, function()
     local view = vim.fn.winsaveview()
-    view.leftcol = math.max(0, (tonumber(view.leftcol) or 0) + columns)
+    view.leftcol = math.min(max_window_leftcol(win), math.max(0, (tonumber(view.leftcol) or 0) + columns))
     vim.fn.winrestview(view)
   end)
 end

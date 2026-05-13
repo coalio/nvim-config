@@ -1,6 +1,7 @@
 local M = {}
 
 local horizontal_scroll_columns = 16
+local widest_line_cache = {}
 
 local excluded_filetypes = {
   NvimTree = true,
@@ -115,6 +116,45 @@ local function line_end_virtual_column(lnum)
   return math.max(1, (tonumber(vim.fn.virtcol({ lnum, "$" })) or 1) - 1)
 end
 
+local function invalidate_widest_line_cache(buf)
+  if buf then
+    widest_line_cache[buf] = nil
+  end
+end
+
+local function widest_line_virtual_column(buf)
+  local tick = vim.api.nvim_buf_get_changedtick(buf)
+  local cached = widest_line_cache[buf]
+  if cached and cached.tick == tick then
+    return cached.width
+  end
+
+  local widest = 1
+  local line_count = vim.api.nvim_buf_line_count(buf)
+
+  for lnum = 1, line_count do
+    local width = line_end_virtual_column(lnum)
+    if width > widest then
+      widest = width
+    end
+  end
+
+  widest_line_cache[buf] = {
+    tick = tick,
+    width = widest,
+  }
+
+  return widest
+end
+
+local function max_leftcol(win)
+  local buf = vim.api.nvim_win_get_buf(win)
+  local width = text_width(win)
+  local widest = widest_line_virtual_column(buf)
+
+  return math.max(0, widest - width)
+end
+
 local function drag_cursor_into_view(win, view, target_leftcol)
   local width = text_width(win)
   local margin = math.min(tonumber(vim.wo[win].sidescrolloff) or 0, math.floor(width / 3))
@@ -149,7 +189,7 @@ function M.scroll_horizontally(columns, win)
 
   vim.api.nvim_win_call(win, function()
     local view = vim.fn.winsaveview()
-    local target_leftcol = math.max(0, (tonumber(view.leftcol) or 0) + columns)
+    local target_leftcol = math.min(max_leftcol(win), math.max(0, (tonumber(view.leftcol) or 0) + columns))
     drag_cursor_into_view(win, view, target_leftcol)
     view.leftcol = target_leftcol
     vim.fn.winrestview(view)
@@ -175,6 +215,13 @@ function M.setup()
   end)
 
   local group = vim.api.nvim_create_augroup("EditorHorizontalScrolling", { clear = true })
+  vim.api.nvim_create_autocmd({ "BufDelete", "BufWipeout", "TextChanged", "TextChangedI" }, {
+    group = group,
+    callback = function(args)
+      invalidate_widest_line_cache(args.buf)
+    end,
+  })
+
   vim.api.nvim_create_autocmd({ "BufWinEnter", "FileType", "WinEnter" }, {
     group = group,
     callback = function(args)
