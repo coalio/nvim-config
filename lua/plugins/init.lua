@@ -23,6 +23,7 @@ return {
 
       vim.opt.runtimepath:prepend(local_diagnostics_root)
       vim.g.coc_user_config = vim.tbl_extend("force", vim.g.coc_user_config or {}, {
+        ["suggest.autoTrigger"] = "none",
         ["localDiagnostics.pyright.enabled"] = local_pyright_diagnostics_enabled,
         ["pyright.disableDiagnostics"] = local_pyright_diagnostics_enabled,
       })
@@ -69,6 +70,11 @@ return {
 
   {
     "saghen/blink.cmp",
+    enabled = false,
+  },
+
+  {
+    "rafamadriz/friendly-snippets",
     enabled = false,
   },
 
