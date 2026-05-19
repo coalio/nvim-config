@@ -358,8 +358,8 @@ function M.open(dir)
     previewer = false,
     layout_strategy = "center",
     layout_config = {
-      width = 0.7,
-      height = 0.6,
+      width = 0.42,
+      height = 0.72,
       anchor = "N",
       prompt_position = "top",
     },

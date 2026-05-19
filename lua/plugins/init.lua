@@ -124,14 +124,26 @@ return {
 
   {
     "nvim-tree/nvim-tree.lua",
+    init = function()
+      require("configs.nvim_tree_git_highlights").setup()
+    end,
     opts = {
       sync_root_with_cwd = false,
+      filters = {
+        git_ignored = false,
+      },
       update_focused_file = {
         update_root = false,
       },
       renderer = {
         root_folder_label = ":t",
+        highlight_git = "name",
         highlight_opened_files = "name",
+        icons = {
+          show = {
+            git = false,
+          },
+        },
       },
     },
   },
