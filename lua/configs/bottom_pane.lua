@@ -7,6 +7,8 @@ local terminal_sessions = {}
 local terminal_order = {}
 local active_terminal_id
 local terminal_session_width = 7
+local terminal_session_rail_buf
+local terminal_session_rail_win
 local problem_count = 0
 local problems_loading = false
 local diagnostics_response_received = false
@@ -79,17 +81,16 @@ local function highlight_with_background(groups)
   return groups[#groups]
 end
 
-local function default_link(name, target)
+local function link_highlight(name, target)
   pcall(vim.api.nvim_set_hl, 0, name, {
-    default = true,
     link = target,
   })
 end
 
 local function setup_terminal_session_highlights()
-  default_link("BottomPaneTerminalSessionBase", "Normal")
-  default_link("BottomPaneTerminalSessionInactive", "Comment")
-  default_link("BottomPaneTerminalSessionActive", highlight_with_background({
+  link_highlight("BottomPaneTerminalSessionBase", "Normal")
+  link_highlight("BottomPaneTerminalSessionInactive", "Comment")
+  link_highlight("BottomPaneTerminalSessionActive", highlight_with_background({
     "PmenuSel",
     "Visual",
     "TabLineSel",
@@ -129,6 +130,48 @@ local function set_window_buffer(win, buf)
     pcall(vim.api.nvim_set_option_value, "winfixbuf", true, { scope = "local", win = win })
   end
   return ok
+end
+
+local function should_preserve_width(win)
+  if not is_valid_win(win) or vim.w[win].bottom_pane_kind or vim.w[win].bottom_pane_terminal_session_rail then
+    return false
+  end
+
+  local ok, config = pcall(vim.api.nvim_win_get_config, win)
+  return ok and config.relative == ""
+end
+
+local function with_stable_window_widths(fn)
+  local current_win = vim.api.nvim_get_current_win()
+  local widths = {}
+
+  for _, win in ipairs(vim.api.nvim_list_wins()) do
+    if should_preserve_width(win) then
+      table.insert(widths, {
+        win = win,
+        width = vim.api.nvim_win_get_width(win),
+      })
+    end
+  end
+
+  local equalalways = vim.o.equalalways
+  vim.o.equalalways = false
+  local ok, err = pcall(fn)
+  vim.o.equalalways = equalalways
+
+  for _, entry in ipairs(widths) do
+    if is_valid_win(entry.win) then
+      pcall(vim.api.nvim_win_set_width, entry.win, entry.width)
+    end
+  end
+
+  if is_valid_win(current_win) then
+    pcall(vim.api.nvim_set_current_win, current_win)
+  end
+
+  if not ok then
+    error(err)
+  end
 end
 
 local function mark_bottom_pane_window(win, kind)
@@ -368,8 +411,13 @@ local function terminal_session_id_for_view_row(row)
   end
 end
 
+local function current_window_is_terminal_session_rail()
+  local ok, win = pcall(vim.api.nvim_get_current_win)
+  return ok and is_valid_win(win) and vim.w[win].bottom_pane_terminal_session_rail == true
+end
+
 local function render_terminal_session_statuscolumn()
-  local row = terminal_session_row_for_lnum(vim.v.lnum)
+  local row = current_window_is_terminal_session_rail() and tonumber(vim.v.lnum) or terminal_session_row_for_lnum(vim.v.lnum)
   local id = terminal_session_id_for_view_row(row)
   if not id then
     return ""
@@ -379,17 +427,106 @@ local function render_terminal_session_statuscolumn()
   return highlight .. session_label(string.format("(%d)", id)) .. "%*"
 end
 
-local function close_terminal_windows()
-  if #terminal_order == 0 then
+local function close_terminal_session_rail()
+  with_stable_window_widths(function()
+    if is_valid_win(terminal_session_rail_win) then
+      pcall(vim.api.nvim_win_close, terminal_session_rail_win, true)
+    end
+    terminal_session_rail_win = nil
+  end)
+end
+
+local function sync_terminal_session_rail_lines()
+  if not is_valid_buf(terminal_session_rail_buf) then
     return
   end
 
-  for _, win in ipairs(vim.api.nvim_list_wins()) do
-    if is_valid_win(win) and is_terminal_session_buf(vim.api.nvim_win_get_buf(win)) then
-      clear_bottom_pane_window(win)
-      pcall(vim.api.nvim_win_close, win, true)
-    end
+  local line_count = math.max(1, #terminal_order)
+  local lines = {}
+  for _ = 1, line_count do
+    table.insert(lines, "")
   end
+
+  vim.bo[terminal_session_rail_buf].modifiable = true
+  vim.api.nvim_buf_set_lines(terminal_session_rail_buf, 0, -1, false, lines)
+  vim.bo[terminal_session_rail_buf].modifiable = false
+end
+
+local function ensure_terminal_session_rail_buf()
+  if is_valid_buf(terminal_session_rail_buf) then
+    return terminal_session_rail_buf
+  end
+
+  terminal_session_rail_buf = vim.api.nvim_create_buf(false, true)
+  vim.bo[terminal_session_rail_buf].bufhidden = "wipe"
+  vim.bo[terminal_session_rail_buf].buftype = "nofile"
+  vim.bo[terminal_session_rail_buf].filetype = "bottom-pane-terminal-sessions"
+  vim.bo[terminal_session_rail_buf].swapfile = false
+  sync_terminal_session_rail_lines()
+  return terminal_session_rail_buf
+end
+
+local function configure_terminal_session_rail(win)
+  if not is_valid_win(win) then
+    return
+  end
+
+  vim.w[win].bottom_pane_terminal_session_rail = true
+  if vim.fn.exists("+winfixbuf") == 1 then
+    pcall(vim.api.nvim_set_option_value, "winfixbuf", true, { scope = "local", win = win })
+  end
+  pcall(vim.api.nvim_set_option_value, "number", true, { scope = "local", win = win })
+  pcall(vim.api.nvim_set_option_value, "relativenumber", false, { scope = "local", win = win })
+  pcall(vim.api.nvim_set_option_value, "numberwidth", terminal_session_width, { scope = "local", win = win })
+  pcall(vim.api.nvim_set_option_value, "signcolumn", "no", { scope = "local", win = win })
+  pcall(vim.api.nvim_set_option_value, "foldcolumn", "0", { scope = "local", win = win })
+  pcall(vim.api.nvim_set_option_value, "statuscolumn", terminal_session_statuscolumn_expr, { scope = "local", win = win })
+  pcall(vim.api.nvim_set_option_value, "cursorline", false, { scope = "local", win = win })
+  pcall(vim.api.nvim_set_option_value, "cursorcolumn", false, { scope = "local", win = win })
+  pcall(vim.api.nvim_set_option_value, "wrap", false, { scope = "local", win = win })
+  pcall(vim.api.nvim_set_option_value, "winfixwidth", true, { scope = "local", win = win })
+  pcall(vim.api.nvim_set_option_value, "winbar", "", { scope = "local", win = win })
+  pcall(vim.api.nvim_set_option_value, "fillchars", "eob: ", { scope = "local", win = win })
+  pcall(vim.api.nvim_set_option_value, "winhighlight", terminal_session_winhighlight, { scope = "local", win = win })
+  pcall(vim.api.nvim_win_set_width, win, terminal_session_width)
+end
+
+local function ensure_terminal_session_rail(term_win)
+  if not is_valid_win(term_win) or #terminal_order == 0 then
+    close_terminal_session_rail()
+    return
+  end
+
+  local buf = ensure_terminal_session_rail_buf()
+  sync_terminal_session_rail_lines()
+
+  if not is_valid_win(terminal_session_rail_win) then
+    with_stable_window_widths(function()
+      vim.api.nvim_set_current_win(term_win)
+      vim.cmd("rightbelow vertical " .. terminal_session_width .. "split")
+      terminal_session_rail_win = vim.api.nvim_get_current_win()
+      vim.api.nvim_win_set_buf(terminal_session_rail_win, buf)
+      configure_terminal_session_rail(terminal_session_rail_win)
+      pcall(vim.api.nvim_set_current_win, term_win)
+    end)
+    return
+  end
+
+  set_window_buffer(terminal_session_rail_win, buf)
+  configure_terminal_session_rail(terminal_session_rail_win)
+end
+
+local function close_terminal_windows()
+  with_stable_window_widths(function()
+    close_terminal_session_rail()
+
+    for _, win in ipairs(vim.api.nvim_list_wins()) do
+      if is_valid_win(win) and is_terminal_session_buf(vim.api.nvim_win_get_buf(win)) then
+        clear_bottom_pane_window(win)
+        pcall(vim.api.nvim_win_close, win, true)
+      end
+    end
+  end)
 end
 
 local function close_empty_problems_windows()
@@ -513,14 +650,13 @@ local function configure_terminal_window(win)
 
   mark_bottom_pane_window(win, "terminal")
   lock_window_to_buffer(win)
-  pcall(vim.api.nvim_set_option_value, "number", true, { scope = "local", win = win })
+  pcall(vim.api.nvim_set_option_value, "number", false, { scope = "local", win = win })
   pcall(vim.api.nvim_set_option_value, "relativenumber", false, { scope = "local", win = win })
-  pcall(vim.api.nvim_set_option_value, "numberwidth", terminal_session_width, { scope = "local", win = win })
   pcall(vim.api.nvim_set_option_value, "signcolumn", "no", { scope = "local", win = win })
   pcall(vim.api.nvim_set_option_value, "foldcolumn", "0", { scope = "local", win = win })
-  pcall(vim.api.nvim_set_option_value, "statuscolumn", terminal_session_statuscolumn_expr, { scope = "local", win = win })
+  pcall(vim.api.nvim_set_option_value, "statuscolumn", "", { scope = "local", win = win })
   pcall(vim.api.nvim_set_option_value, "cursorline", false, { scope = "local", win = win })
-  pcall(vim.api.nvim_set_option_value, "winhighlight", terminal_session_winhighlight, { scope = "local", win = win })
+  ensure_terminal_session_rail(win)
 end
 
 local function get_problem_window_option(win, option, fallback)
@@ -915,10 +1051,13 @@ function M.close_current_terminal()
     active_terminal_id = nil
     terminal_buf = nil
     terminal_chan = nil
-    if is_valid_win(win) then
-      clear_bottom_pane_window(win)
-      pcall(vim.api.nvim_win_close, win, true)
-    end
+    with_stable_window_widths(function()
+      close_terminal_session_rail()
+      if is_valid_win(win) then
+        clear_bottom_pane_window(win)
+        pcall(vim.api.nvim_win_close, win, true)
+      end
+    end)
     refresh_winbars()
   end
 
@@ -935,11 +1074,19 @@ end
 
 function M.terminal_session_click()
   local pos = vim.fn.getmousepos()
-  if not pos or not is_valid_win(pos.winid) or vim.w[pos.winid].bottom_pane_kind ~= "terminal" then
+  if
+    not pos
+    or not is_valid_win(pos.winid)
+    or (vim.w[pos.winid].bottom_pane_kind ~= "terminal" and vim.w[pos.winid].bottom_pane_terminal_session_rail ~= true)
+  then
     return
   end
 
   local row = vim.api.nvim_win_call(pos.winid, function()
+    if vim.w[pos.winid].bottom_pane_terminal_session_rail == true then
+      return tonumber(pos.line)
+    end
+
     local first = tonumber(vim.fn.line "w0") or 1
     return (tonumber(pos.line) or first) - first + 1
   end)
@@ -2156,6 +2303,15 @@ function M.setup()
     group = group,
     callback = function(args)
       local win = tonumber(args.match)
+      if win == terminal_session_rail_win then
+        terminal_session_rail_win = nil
+        return
+      end
+
+      if is_valid_win(terminal_session_rail_win) and win == bottom_win and active_kind == "terminal" then
+        close_terminal_session_rail()
+      end
+
       if win == bottom_win then
         problems_loading = false
         waiting_for_local_diagnostics = false
