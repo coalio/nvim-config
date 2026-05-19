@@ -3,6 +3,10 @@ local M = {}
 local height = 12
 local terminal_buf
 local terminal_chan
+local terminal_sessions = {}
+local terminal_order = {}
+local active_terminal_id
+local terminal_session_width = 7
 local problem_count = 0
 local problems_loading = false
 local diagnostics_response_received = false
@@ -27,6 +31,17 @@ local reading_coc_diagnostics = false
 local last_diagnostic_list_ns = 0
 local last_diagnostic_list_result
 local pending_problems_focus = false
+local terminal_session_statuscolumn_expr = "%@v:lua.NvChadBottomPaneTerminalSessionClick@%{%v:lua.NvChadBottomPaneTerminalSessionStatusColumn()%}%T"
+local terminal_session_winhighlight = table.concat({
+  "Normal:BottomPaneTerminalSessionBase",
+  "NormalNC:BottomPaneTerminalSessionBase",
+  "EndOfBuffer:BottomPaneTerminalSessionBase",
+  "LineNr:BottomPaneTerminalSessionBase",
+  "CursorLine:BottomPaneTerminalSessionBase",
+  "CursorLineNr:BottomPaneTerminalSessionBase",
+  "SignColumn:BottomPaneTerminalSessionBase",
+  "FoldColumn:BottomPaneTerminalSessionBase",
+}, ",")
 
 local function note_diagnostic_response()
   diagnostics_response_received = true
@@ -53,6 +68,34 @@ local function is_valid_buf(buf)
   return buf and vim.api.nvim_buf_is_valid(buf)
 end
 
+local function highlight_with_background(groups)
+  for _, group in ipairs(groups) do
+    local ok, hl = pcall(vim.api.nvim_get_hl, 0, { name = group, link = false })
+    if ok and (hl.bg or hl.ctermbg) then
+      return group
+    end
+  end
+
+  return groups[#groups]
+end
+
+local function default_link(name, target)
+  pcall(vim.api.nvim_set_hl, 0, name, {
+    default = true,
+    link = target,
+  })
+end
+
+local function setup_terminal_session_highlights()
+  default_link("BottomPaneTerminalSessionBase", "Normal")
+  default_link("BottomPaneTerminalSessionInactive", "Comment")
+  default_link("BottomPaneTerminalSessionActive", highlight_with_background({
+    "PmenuSel",
+    "Visual",
+    "TabLineSel",
+  }))
+end
+
 local function is_fixed_window(win)
   return is_valid_win(win)
     and vim.fn.exists("+winfixbuf") == 1
@@ -65,6 +108,27 @@ local function lock_window_to_buffer(win)
   end
 
   pcall(vim.api.nvim_set_option_value, "winfixbuf", true, { scope = "local", win = win })
+end
+
+local function set_window_buffer(win, buf)
+  if not is_valid_win(win) or not is_valid_buf(buf) then
+    return false
+  end
+
+  local locked = false
+  if vim.fn.exists("+winfixbuf") == 1 then
+    local ok, value = pcall(vim.api.nvim_get_option_value, "winfixbuf", { win = win })
+    locked = ok and value == true
+    if locked then
+      pcall(vim.api.nvim_set_option_value, "winfixbuf", false, { scope = "local", win = win })
+    end
+  end
+
+  local ok = pcall(vim.api.nvim_win_set_buf, win, buf)
+  if locked then
+    pcall(vim.api.nvim_set_option_value, "winfixbuf", true, { scope = "local", win = win })
+  end
+  return ok
 end
 
 local function mark_bottom_pane_window(win, kind)
@@ -125,6 +189,14 @@ end
 
 function _G.NvChadBottomPaneProblems()
   require("configs.bottom_pane").open_problems()
+end
+
+function _G.NvChadBottomPaneTerminalSessionStatusColumn()
+  return require("configs.bottom_pane").terminal_session_statuscolumn()
+end
+
+function _G.NvChadBottomPaneTerminalSessionClick()
+  return require("configs.bottom_pane").terminal_session_click()
 end
 
 local function is_editor_window(win)
@@ -190,13 +262,130 @@ local function focus_editor_window()
   return win
 end
 
+local sync_active_terminal
+
+local function sort_terminal_order()
+  table.sort(terminal_order, function(a, b)
+    return a < b
+  end)
+end
+
+local function lowest_available_terminal_id()
+  local id = 1
+  while terminal_sessions[id] do
+    id = id + 1
+  end
+  return id
+end
+
+local function remove_ordered_terminal(id)
+  for index, session_id in ipairs(terminal_order) do
+    if session_id == id then
+      table.remove(terminal_order, index)
+      return index
+    end
+  end
+end
+
+local function terminal_session_for_buf(buf)
+  if not is_valid_buf(buf) then
+    return nil
+  end
+
+  for _, session in pairs(terminal_sessions) do
+    if session.buf == buf then
+      return session
+    end
+  end
+end
+
+local function is_terminal_session_buf(buf)
+  return terminal_session_for_buf(buf) ~= nil
+end
+
+local function forget_terminal_session_buf(buf)
+  local session = terminal_session_for_buf(buf)
+  if not session then
+    return
+  end
+
+  terminal_sessions[session.id] = nil
+  remove_ordered_terminal(session.id)
+  if active_terminal_id == session.id then
+    sync_active_terminal()
+  end
+end
+
+function sync_active_terminal()
+  local session = active_terminal_id and terminal_sessions[active_terminal_id] or nil
+  if session and is_valid_buf(session.buf) then
+    terminal_buf = session.buf
+    terminal_chan = session.chan
+    return session
+  end
+
+  terminal_buf = nil
+  terminal_chan = nil
+  active_terminal_id = nil
+  for _, id in ipairs(terminal_order) do
+    session = terminal_sessions[id]
+    if session and is_valid_buf(session.buf) then
+      active_terminal_id = id
+      terminal_buf = session.buf
+      terminal_chan = session.chan
+      return session
+    end
+  end
+end
+
+local function active_terminal_session()
+  return sync_active_terminal()
+end
+
+local function session_label(label)
+  if #label >= terminal_session_width then
+    return label
+  end
+
+  local left = math.floor((terminal_session_width - #label) / 2)
+  local right = terminal_session_width - #label - left
+  return string.rep(" ", left) .. label .. string.rep(" ", right)
+end
+
+local function terminal_session_row_for_lnum(lnum)
+  local first = tonumber(vim.fn.line "w0") or 1
+  return tonumber(lnum) and (tonumber(lnum) - first + 1) or nil
+end
+
+local function terminal_session_id_for_view_row(row)
+  row = tonumber(row)
+  if not row or row < 1 then
+    return nil
+  end
+  local id = terminal_order[row]
+  if id and terminal_sessions[id] then
+    return id
+  end
+end
+
+local function render_terminal_session_statuscolumn()
+  local row = terminal_session_row_for_lnum(vim.v.lnum)
+  local id = terminal_session_id_for_view_row(row)
+  if not id then
+    return ""
+  end
+
+  local highlight = id == active_terminal_id and "%#BottomPaneTerminalSessionActive#" or "%#BottomPaneTerminalSessionInactive#"
+  return highlight .. session_label(string.format("(%d)", id)) .. "%*"
+end
+
 local function close_terminal_windows()
-  if not is_valid_buf(terminal_buf) then
+  if #terminal_order == 0 then
     return
   end
 
   for _, win in ipairs(vim.api.nvim_list_wins()) do
-    if is_valid_win(win) and vim.api.nvim_win_get_buf(win) == terminal_buf then
+    if is_valid_win(win) and is_terminal_session_buf(vim.api.nvim_win_get_buf(win)) then
       clear_bottom_pane_window(win)
       pcall(vim.api.nvim_win_close, win, true)
     end
@@ -223,6 +412,16 @@ local function find_window_for_buf(buf)
 
   for _, win in ipairs(vim.api.nvim_list_wins()) do
     if is_valid_win(win) and vim.api.nvim_win_get_buf(win) == buf then
+      return win
+    end
+  end
+end
+
+local function find_terminal_window()
+  for _, id in ipairs(terminal_order) do
+    local session = terminal_sessions[id]
+    local win = session and find_window_for_buf(session.buf)
+    if win then
       return win
     end
   end
@@ -270,7 +469,7 @@ local function trouble_is_open()
 end
 
 local function is_bottom_pane_open()
-  return find_window_for_buf(terminal_buf) ~= nil or find_window_for_buf(empty_problems_buf) ~= nil or trouble_is_open()
+  return find_terminal_window() ~= nil or find_window_for_buf(empty_problems_buf) ~= nil or trouble_is_open()
 end
 
 local function problems_pane_is_open()
@@ -304,6 +503,24 @@ local function configure_problem_window(win)
   } do
     pcall(vim.api.nvim_set_option_value, option, value, { scope = "local", win = win })
   end
+  pcall(vim.api.nvim_set_option_value, "statuscolumn", "", { scope = "local", win = win })
+end
+
+local function configure_terminal_window(win)
+  if not is_valid_win(win) then
+    return
+  end
+
+  mark_bottom_pane_window(win, "terminal")
+  lock_window_to_buffer(win)
+  pcall(vim.api.nvim_set_option_value, "number", true, { scope = "local", win = win })
+  pcall(vim.api.nvim_set_option_value, "relativenumber", false, { scope = "local", win = win })
+  pcall(vim.api.nvim_set_option_value, "numberwidth", terminal_session_width, { scope = "local", win = win })
+  pcall(vim.api.nvim_set_option_value, "signcolumn", "no", { scope = "local", win = win })
+  pcall(vim.api.nvim_set_option_value, "foldcolumn", "0", { scope = "local", win = win })
+  pcall(vim.api.nvim_set_option_value, "statuscolumn", terminal_session_statuscolumn_expr, { scope = "local", win = win })
+  pcall(vim.api.nvim_set_option_value, "cursorline", false, { scope = "local", win = win })
+  pcall(vim.api.nvim_set_option_value, "winhighlight", terminal_session_winhighlight, { scope = "local", win = win })
 end
 
 local function get_problem_window_option(win, option, fallback)
@@ -417,10 +634,14 @@ local function refresh_winbars(active)
     local buf = vim.api.nvim_win_get_buf(win)
     local kind = vim.w[win].bottom_pane_kind
 
-    if buf == terminal_buf then
+    if is_terminal_session_buf(buf) then
       kind = "terminal"
-      lock_window_to_buffer(win)
-      mark_bottom_pane_window(win, kind)
+      local session = terminal_session_for_buf(buf)
+      if session then
+        active_terminal_id = session.id
+        sync_active_terminal()
+      end
+      configure_terminal_window(win)
       set_winbar(win, active == kind and kind or nil)
     elseif buf == empty_problems_buf or (kind == "problems" and vim.bo[buf].filetype == "trouble") then
       kind = "problems"
@@ -494,6 +715,7 @@ local function open_bottom_window(buf, active)
   vim.wo[win].number = false
   vim.wo[win].relativenumber = false
   vim.wo[win].signcolumn = "no"
+  vim.wo[win].statuscolumn = ""
   lock_window_to_buffer(win)
   mark_bottom_pane_window(win, active)
   set_winbar(win, active)
@@ -501,19 +723,94 @@ local function open_bottom_window(buf, active)
   return win
 end
 
-local function ensure_terminal()
-  if is_valid_buf(terminal_buf) and vim.bo[terminal_buf].buftype == "terminal" then
-    return nil
+local function prepare_terminal_window(buf)
+  local win = find_terminal_window()
+  if win then
+    set_window_buffer(win, buf)
+  else
+    win = open_bottom_window(buf, "terminal")
   end
 
-  terminal_buf = vim.api.nvim_create_buf(false, true)
-  local win = open_bottom_window(terminal_buf, "terminal")
-  terminal_chan = vim.fn.termopen(vim.o.shell)
-
-  vim.bo[terminal_buf].buflisted = false
-  vim.b[terminal_buf].bottom_pane_kind = "terminal"
-
+  vim.api.nvim_set_current_win(win)
+  configure_terminal_window(win)
+  set_winbar(win, "terminal")
   return win
+end
+
+local function create_terminal_session(cmd)
+  local id = lowest_available_terminal_id()
+  local buf = vim.api.nvim_create_buf(false, true)
+  local session = {
+    id = id,
+    buf = buf,
+    chan = nil,
+  }
+
+  terminal_sessions[id] = session
+  table.insert(terminal_order, id)
+  sort_terminal_order()
+  active_terminal_id = id
+  sync_active_terminal()
+
+  local win = prepare_terminal_window(buf)
+  local chan
+  vim.api.nvim_win_call(win, function()
+    chan = vim.fn.termopen(vim.o.shell)
+  end)
+
+  session.chan = chan
+  terminal_buf = buf
+  terminal_chan = chan
+
+  vim.bo[buf].buflisted = false
+  vim.b[buf].bottom_pane_kind = "terminal"
+  configure_terminal_window(win)
+
+  if cmd and cmd ~= "" then
+    pcall(vim.api.nvim_chan_send, chan, cmd .. "\n")
+  end
+
+  return session, win
+end
+
+local function ensure_terminal_session()
+  local session = active_terminal_session()
+  if session and is_valid_buf(session.buf) and vim.bo[session.buf].buftype == "terminal" then
+    return session
+  end
+
+  for _, id in ipairs(terminal_order) do
+    session = terminal_sessions[id]
+    if session and is_valid_buf(session.buf) and vim.bo[session.buf].buftype == "terminal" then
+      active_terminal_id = id
+      return sync_active_terminal()
+    end
+  end
+
+  return create_terminal_session()
+end
+
+function M.select_terminal(id)
+  id = tonumber(id)
+  local session = id and terminal_sessions[id] or nil
+  if not session or not is_valid_buf(session.buf) then
+    return false
+  end
+
+  pending_problems_focus = false
+  close_trouble()
+  close_empty_problems_windows()
+
+  active_terminal_id = id
+  sync_active_terminal()
+  local win = find_window_for_buf(session.buf) or prepare_terminal_window(session.buf)
+  vim.api.nvim_set_current_win(win)
+  set_window_buffer(win, session.buf)
+  configure_terminal_window(win)
+  set_winbar(win, "terminal")
+  refresh_winbars("terminal")
+  vim.cmd "startinsert"
+  return true
 end
 
 function M.open_terminal(cmd)
@@ -521,18 +818,135 @@ function M.open_terminal(cmd)
   close_trouble()
   close_empty_problems_windows()
 
-  local win = ensure_terminal() or find_window_for_buf(terminal_buf) or open_bottom_window(terminal_buf, "terminal")
+  local session = ensure_terminal_session()
+  if not session then
+    return
+  end
+
+  local win = find_window_for_buf(session.buf) or prepare_terminal_window(session.buf)
   vim.api.nvim_set_current_win(win)
-  mark_bottom_pane_window(win, "terminal")
+  set_window_buffer(win, session.buf)
+  configure_terminal_window(win)
   set_winbar(win, "terminal")
   refresh_winbars("terminal")
 
   if cmd and cmd ~= "" then
-    local chan = vim.bo[terminal_buf].channel or terminal_chan
+    local chan = vim.bo[session.buf].channel or session.chan
     pcall(vim.api.nvim_chan_send, chan, cmd .. "\n")
   end
 
   vim.cmd "startinsert"
+end
+
+function M.new_terminal(cmd)
+  pending_problems_focus = false
+  close_trouble()
+  close_empty_problems_windows()
+
+  create_terminal_session(cmd)
+  refresh_winbars("terminal")
+  vim.cmd "startinsert"
+end
+
+function M.next_terminal()
+  if #terminal_order == 0 then
+    M.open_terminal()
+    return
+  end
+
+  local current_index = 1
+  for index, id in ipairs(terminal_order) do
+    if id == active_terminal_id then
+      current_index = index
+      break
+    end
+  end
+
+  local next_index = current_index % #terminal_order + 1
+  M.select_terminal(terminal_order[next_index])
+end
+
+function M.prev_terminal()
+  if #terminal_order == 0 then
+    M.open_terminal()
+    return
+  end
+
+  local current_index = 1
+  for index, id in ipairs(terminal_order) do
+    if id == active_terminal_id then
+      current_index = index
+      break
+    end
+  end
+
+  local prev_index = current_index == 1 and #terminal_order or current_index - 1
+  M.select_terminal(terminal_order[prev_index])
+end
+
+function M.close_current_terminal()
+  local session = active_terminal_session()
+  if not session then
+    return false
+  end
+
+  local id = session.id
+  local win = find_window_for_buf(session.buf) or find_terminal_window()
+  local removed_index = remove_ordered_terminal(id) or 1
+  terminal_sessions[id] = nil
+
+  local next_id = terminal_order[removed_index] or terminal_order[removed_index - 1] or terminal_order[1]
+  if session.chan then
+    pcall(vim.fn.jobstop, session.chan)
+  end
+
+  if next_id and terminal_sessions[next_id] then
+    active_terminal_id = next_id
+    local next_session = sync_active_terminal()
+    if is_valid_win(win) and next_session then
+      set_window_buffer(win, next_session.buf)
+      vim.api.nvim_set_current_win(win)
+      configure_terminal_window(win)
+      set_winbar(win, "terminal")
+      refresh_winbars("terminal")
+      vim.cmd "startinsert"
+    end
+  else
+    active_terminal_id = nil
+    terminal_buf = nil
+    terminal_chan = nil
+    if is_valid_win(win) then
+      clear_bottom_pane_window(win)
+      pcall(vim.api.nvim_win_close, win, true)
+    end
+    refresh_winbars()
+  end
+
+  if is_valid_buf(session.buf) then
+    pcall(vim.api.nvim_buf_delete, session.buf, { force = true })
+  end
+
+  return true
+end
+
+function M.terminal_session_statuscolumn()
+  return render_terminal_session_statuscolumn()
+end
+
+function M.terminal_session_click()
+  local pos = vim.fn.getmousepos()
+  if not pos or not is_valid_win(pos.winid) or vim.w[pos.winid].bottom_pane_kind ~= "terminal" then
+    return
+  end
+
+  local row = vim.api.nvim_win_call(pos.winid, function()
+    local first = tonumber(vim.fn.line "w0") or 1
+    return (tonumber(pos.line) or first) - first + 1
+  end)
+  local id = terminal_session_id_for_view_row(row)
+  if id then
+    M.select_terminal(id)
+  end
 end
 
 local function diagnostic_type(severity)
@@ -1668,11 +2082,41 @@ function M.patch_nvchad_tabufline()
 end
 
 function M.setup()
+  setup_terminal_session_highlights()
   M.patch_nvchad_tabufline()
 
   vim.api.nvim_create_user_command("BottomTerm", function(opts)
     M.open_terminal(opts.args)
   end, { nargs = "*", complete = "shellcmd" })
+
+  vim.api.nvim_create_user_command("BottomTermNew", function(opts)
+    M.new_terminal(opts.args)
+  end, { nargs = "*", complete = "shellcmd" })
+
+  vim.api.nvim_create_user_command("BottomTermSelect", function(opts)
+    M.select_terminal(opts.args)
+  end, {
+    nargs = 1,
+    complete = function()
+      local ids = {}
+      for _, id in ipairs(terminal_order) do
+        table.insert(ids, tostring(id))
+      end
+      return ids
+    end,
+  })
+
+  vim.api.nvim_create_user_command("BottomTermNext", function()
+    M.next_terminal()
+  end, {})
+
+  vim.api.nvim_create_user_command("BottomTermPrev", function()
+    M.prev_terminal()
+  end, {})
+
+  vim.api.nvim_create_user_command("BottomTermClose", function()
+    M.close_current_terminal()
+  end, {})
 
   vim.api.nvim_create_user_command("Problems", function()
     M.open_problems()
@@ -1704,6 +2148,10 @@ function M.setup()
   end, {})
 
   local group = vim.api.nvim_create_augroup("BottomPane", { clear = true })
+  vim.api.nvim_create_autocmd("ColorScheme", {
+    group = group,
+    callback = setup_terminal_session_highlights,
+  })
   vim.api.nvim_create_autocmd("WinClosed", {
     group = group,
     callback = function(args)
@@ -1725,6 +2173,7 @@ function M.setup()
         file = vim.api.nvim_buf_get_name(args.buf)
       end
 
+      forget_terminal_session_buf(args.buf)
       pending_buffer_refreshes[args.buf] = nil
       remove_buffer_diagnostics(args.buf, file)
     end,

@@ -18,6 +18,41 @@ local function close_bottom_pane()
   end
 end
 
+local function is_codex_buffer(buf)
+  if not vim.api.nvim_buf_is_valid(buf) then
+    return false
+  end
+
+  local ft = vim.bo[buf].filetype
+  local name = vim.api.nvim_buf_get_name(buf)
+  return ft == "codex" or ft == "codex-session-list" or name:match "^codex://"
+end
+
+local function close_codex_panes()
+  local codex = package.loaded["codex"]
+  if codex and type(codex.close) == "function" then
+    pcall(codex.close)
+  end
+
+  local session_list = package.loaded["codex.session_list"]
+  if session_list and type(session_list.close) == "function" then
+    pcall(session_list.close)
+  end
+
+  for _, win in ipairs(vim.api.nvim_list_wins()) do
+    local buf = vim.api.nvim_win_get_buf(win)
+    if vim.w[win].codex_session_list or is_codex_buffer(buf) then
+      pcall(vim.api.nvim_win_close, win, true)
+    end
+  end
+
+  for _, buf in ipairs(vim.api.nvim_list_bufs()) do
+    if is_codex_buffer(buf) then
+      pcall(vim.api.nvim_buf_delete, buf, { force = true })
+    end
+  end
+end
+
 pcall(vim.api.nvim_del_augroup_by_name, "nvchad_dashboard")
 
 autocmd("BufReadPost", {
@@ -65,6 +100,7 @@ autocmd("VimEnter", {
 autocmd("User", {
   pattern = "PersistenceSavePre",
   callback = function()
+    close_codex_panes()
     close_bottom_pane()
     wipe_terminal_buffers()
 
