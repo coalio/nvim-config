@@ -81,16 +81,32 @@ local function highlight_with_background(groups)
   return groups[#groups]
 end
 
-local function link_highlight(name, target)
+local function default_link(name, target)
   pcall(vim.api.nvim_set_hl, 0, name, {
+    default = true,
     link = target,
   })
 end
 
-local function setup_terminal_session_highlights()
-  link_highlight("BottomPaneTerminalSessionBase", "Normal")
-  link_highlight("BottomPaneTerminalSessionInactive", "Comment")
-  link_highlight("BottomPaneTerminalSessionActive", highlight_with_background({
+local function reset_terminal_session_highlights()
+  for _, group in ipairs({
+    "BottomPaneTerminalSessionBase",
+    "BottomPaneTerminalSessionInactive",
+    "BottomPaneTerminalSessionActive",
+  }) do
+    pcall(vim.cmd, "highlight clear " .. group)
+  end
+end
+
+local function setup_terminal_session_highlights(opts)
+  opts = opts or {}
+  if opts.reset then
+    reset_terminal_session_highlights()
+  end
+
+  default_link("BottomPaneTerminalSessionBase", "Normal")
+  default_link("BottomPaneTerminalSessionInactive", "Comment")
+  default_link("BottomPaneTerminalSessionActive", highlight_with_background({
     "PmenuSel",
     "Visual",
     "TabLineSel",
@@ -2229,7 +2245,7 @@ function M.patch_nvchad_tabufline()
 end
 
 function M.setup()
-  setup_terminal_session_highlights()
+  setup_terminal_session_highlights({ reset = true })
   M.patch_nvchad_tabufline()
 
   vim.api.nvim_create_user_command("BottomTerm", function(opts)
