@@ -129,6 +129,40 @@ return {
     end,
     opts = {
       sync_root_with_cwd = false,
+      on_attach = function(bufnr)
+        local api = require "nvim-tree.api"
+
+        api.map.on_attach.default(bufnr)
+
+        local function opts(desc)
+          return {
+            desc = "nvim-tree: " .. desc,
+            buffer = bufnr,
+            noremap = true,
+            silent = true,
+            nowait = true,
+          }
+        end
+
+        local function opens_parent(node)
+          return node and (node.name == ".." or node.parent == nil)
+        end
+
+        local function open_node(open)
+          return function(node)
+            node = node or api.tree.get_node_under_cursor()
+            if not node or opens_parent(node) then
+              return
+            end
+
+            open(node)
+          end
+        end
+
+        vim.keymap.set("n", "<CR>", open_node(api.node.open.edit), opts("Open"))
+        vim.keymap.set("n", "o", open_node(api.node.open.edit), opts("Open"))
+        vim.keymap.set("n", "<2-LeftMouse>", open_node(api.node.open.edit), opts("Open"))
+      end,
       filters = {
         git_ignored = false,
       },

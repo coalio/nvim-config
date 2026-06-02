@@ -1,5 +1,7 @@
 local M = {}
 local skip_next_persistence_tree_refresh = false
+local manual_workspace_selection = false
+local active_workspace_dir = nil
 
 local function reset_bottom_pane_diagnostics()
   local ok, bottom_pane = pcall(require, "configs.bottom_pane")
@@ -117,6 +119,55 @@ local function session_file_exists()
   return vim.fn.filereadable(fallback) == 1
 end
 
+local function cd_workspace(dir)
+  vim.cmd("cd " .. vim.fn.fnameescape(dir))
+
+  for _, win in ipairs(vim.api.nvim_list_wins()) do
+    if vim.api.nvim_win_is_valid(win) and vim.api.nvim_win_get_config(win).relative == "" then
+      pcall(vim.api.nvim_win_call, win, function()
+        vim.cmd("lcd " .. vim.fn.fnameescape(dir))
+      end)
+    end
+  end
+end
+
+local function sync_nvim_tree(dir, opts)
+  opts = opts or {}
+
+  local ok, api = pcall(require, "nvim-tree.api")
+  if not ok then
+    return
+  end
+
+  local should_open = api.tree.is_visible() or opts.open_tree or opts.focus_tree
+  if not should_open then
+    return
+  end
+
+  local ok_core, core = pcall(require, "nvim-tree.core")
+  if ok_core then
+    core.purge_all_state()
+  else
+    api.tree.close()
+  end
+
+  vim.schedule(function()
+    cd_workspace(dir)
+    api.tree.open({ path = dir })
+
+    local tree_win = api.tree.winid()
+    if tree_win and vim.api.nvim_win_is_valid(tree_win) then
+      pcall(vim.api.nvim_win_call, tree_win, function()
+        vim.cmd("lcd " .. vim.fn.fnameescape(dir))
+      end)
+    end
+
+    if opts.focus_tree then
+      api.tree.focus()
+    end
+  end)
+end
+
 local function reset_workspace_buffers()
   prepare_workspace_replacement()
 
@@ -183,13 +234,15 @@ end
 local function set_workspace(dir, opts)
   opts = opts or {}
   dir = normalize_dir(dir)
+  manual_workspace_selection = true
+  active_workspace_dir = dir
   local previous_dir = normalize_dir(vim.loop.cwd())
 
   if previous_dir ~= dir then
     reset_bottom_pane_diagnostics()
   end
 
-  vim.cmd("cd " .. vim.fn.fnameescape(dir))
+  cd_workspace(dir)
   close_alpha_buffer()
 
   if opts.reset_buffers then
@@ -219,21 +272,9 @@ local function set_workspace(dir, opts)
     pcall(vim.cmd, "enew")
   end
 
-  local ok, api = pcall(require, "nvim-tree.api")
-  if ok then
-    local visible = api.tree.is_visible()
+  cd_workspace(dir)
 
-    if visible then
-      api.tree.change_root(dir)
-    elseif opts.open_tree or opts.focus_tree then
-      api.tree.open()
-      api.tree.change_root(dir)
-    end
-
-    if opts.focus_tree then
-      api.tree.focus()
-    end
-  end
+  sync_nvim_tree(dir, { open_tree = opts.open_tree, focus_tree = opts.focus_tree })
 
   return dir, loaded_session
 end
@@ -314,6 +355,21 @@ function M.consume_persistence_tree_refresh_skip()
 
   skip_next_persistence_tree_refresh = false
   return true
+end
+
+function M.has_manual_workspace_selection()
+  return manual_workspace_selection
+end
+
+function M.active_workspace_dir()
+  return active_workspace_dir
+end
+
+function M.sync_nvim_tree(dir, opts)
+  dir = normalize_dir(dir)
+  active_workspace_dir = dir
+  cd_workspace(dir)
+  sync_nvim_tree(dir, opts)
 end
 
 function M.set_workspace(dir, opts)

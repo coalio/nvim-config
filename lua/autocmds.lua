@@ -77,6 +77,7 @@ autocmd("VimEnter", {
     local no_args = vim.fn.argc() == 0
     local target = data.file ~= "" and vim.fn.fnamemodify(data.file, ":p") or vim.fn.getcwd()
     local is_dir = target ~= "" and vim.fn.isdirectory(target) == 1
+    local startup_cwd = vim.fn.getcwd()
 
     if is_dir then
       vim.cmd.cd(target)
@@ -84,6 +85,18 @@ autocmd("VimEnter", {
 
     if no_args then
       vim.schedule(function()
+        local browser = package.loaded["configs.browser"]
+        if
+          vim.fn.getcwd() ~= startup_cwd
+          or (
+            browser
+            and browser.has_manual_workspace_selection
+            and browser.has_manual_workspace_selection()
+          )
+        then
+          return
+        end
+
         persistence.load { last = true }
       end)
       return
@@ -123,12 +136,14 @@ autocmd("User", {
       close_bottom_pane()
       wipe_terminal_buffers()
 
-      local ok, api = pcall(require, "nvim-tree.api")
-      if ok then
-        if not api.tree.is_visible() then
-          api.tree.open()
+      local workspace = browser and browser.active_workspace_dir and browser.active_workspace_dir()
+      if browser and browser.sync_nvim_tree then
+        browser.sync_nvim_tree(workspace or vim.fn.getcwd(), { open_tree = true })
+      else
+        local ok, api = pcall(require, "nvim-tree.api")
+        if ok then
+          api.tree.open({ path = vim.fn.getcwd() })
         end
-        api.tree.change_root(vim.fn.getcwd())
       end
     end)
   end,
