@@ -21,6 +21,10 @@ local excluded_buftypes = {
   terminal = true,
 }
 
+local wrapped_filetypes = {
+  markdown = true,
+}
+
 local function set_window_option(win, option, value)
   pcall(vim.api.nvim_set_option_value, option, value, { scope = "local", win = win })
 end
@@ -46,16 +50,24 @@ function M.is_editor_window(win)
   return not excluded_buftypes[buftype] and not excluded_filetypes[filetype]
 end
 
+local function should_wrap_buffer(buf)
+  local filetype = vim.bo[buf].filetype
+  return wrapped_filetypes[filetype] or filetype:match("^markdown%.") ~= nil
+end
+
 function M.configure_window(win)
   if not M.is_editor_window(win) then
     return false
   end
 
+  local buf = vim.api.nvim_win_get_buf(win)
+  local wrap_text = should_wrap_buffer(buf)
+
   for option, value in pairs {
     breakindent = false,
-    linebreak = false,
+    linebreak = wrap_text,
     smoothscroll = false,
-    wrap = false,
+    wrap = wrap_text,
   } do
     set_window_option(win, option, value)
   end
