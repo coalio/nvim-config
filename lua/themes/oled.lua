@@ -32,6 +32,7 @@ M.base_30 = {
   cyan = "#89ddff",
   statusline_bg = "#000000",
   lightbg = "#0f0f0f",
+  selection_bg = "#242424",
   pmenu_bg = "#6e98eb",
   folder_bg = "#6e98eb",
 }
@@ -58,6 +59,11 @@ M.base_16 = {
 M.type = "dark"
 
 M.polish_hl = {
+  defaults = {
+    Visual = { bg = M.base_30.selection_bg },
+    VisualNOS = { bg = M.base_30.selection_bg },
+  },
+
   treesitter = {
     ["@attribute"] = { fg = M.base_30.purple },
     ["@conditional.ternary"] = { fg = M.base_30.cyan },
