@@ -210,10 +210,11 @@ return {
       opts.extensions_list = opts.extensions_list or {}
 
       -- Telescope's picker-local vertical-open binding masks the global paste mapping.
-      opts.defaults = opts.defaults or {}
-      opts.defaults.mappings = opts.defaults.mappings or {}
-      opts.defaults.mappings.i = opts.defaults.mappings.i or {}
-      opts.defaults.mappings.i["<C-v>"] = function()
+      opts.pickers = opts.pickers or {}
+      opts.pickers.live_grep = opts.pickers.live_grep or {}
+      opts.pickers.live_grep.mappings = opts.pickers.live_grep.mappings or {}
+      opts.pickers.live_grep.mappings.i = opts.pickers.live_grep.mappings.i or {}
+      opts.pickers.live_grep.mappings.i["<C-v>"] = function()
         vim.api.nvim_paste(_G.ClipUnix(), true, -1)
       end
 
