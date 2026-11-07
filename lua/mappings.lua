@@ -3,7 +3,17 @@ local map = vim.keymap.set
 
 map("n", "<C-p>", "<cmd>Telescope find_files<CR>", { desc = "Find files" })
 map("n", "<F1>", "<cmd>Telescope keymaps<CR>", { desc = "Show keymaps" })
-map("n", "<F2>", "<cmd>Telescope live_grep<CR>", { desc = "Live grep" })
+map("n", "<F2>", function()
+  require("telescope.builtin").live_grep({
+    attach_mappings = function(_, telescope_map)
+      -- Live grep is a text prompt, so Ctrl-V should paste rather than open an empty result vertically.
+      telescope_map({ "i", "n" }, "<C-v>", function()
+        vim.api.nvim_paste(_G.ClipUnix(), true, -1)
+      end)
+      return true
+    end,
+  })
+end, { desc = "Live grep" })
 map("n", "<F3>", "<cmd>set hlsearch!<CR>", { desc = "Toggle search highlight" })
 map("n", "<C-_>", "<cmd>Telescope current_buffer_fuzzy_find<CR>", { desc = "Find in current buffer" })
 
