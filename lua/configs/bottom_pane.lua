@@ -9,6 +9,7 @@ local active_terminal_id
 local terminal_session_width = 7
 local terminal_session_rail_buf
 local terminal_session_rail_win
+local terminal_layout_refresh_pending = false
 local problem_count = 0
 local problems_loading = false
 local diagnostics_response_received = false
@@ -482,6 +483,32 @@ local function ensure_terminal_session_rail_buf()
   return terminal_session_rail_buf
 end
 
+local function resize_terminal_session_rail(win)
+  -- give neighboring splits' released space to the terminal, keeping the rail fixed
+  if is_valid_win(win) and vim.api.nvim_win_get_width(win) ~= terminal_session_width then
+    pcall(vim.api.nvim_win_set_width, win, terminal_session_width)
+  end
+end
+
+local function schedule_terminal_layout_refresh()
+  if terminal_layout_refresh_pending or not is_valid_win(terminal_session_rail_win) then
+    return
+  end
+
+  -- coalesce split events and wait until closing or opening windows has finished
+  terminal_layout_refresh_pending = true
+  vim.schedule(function()
+    terminal_layout_refresh_pending = false
+    local win = terminal_session_rail_win
+    if not is_valid_win(win) or vim.api.nvim_win_get_tabpage(win) ~= vim.api.nvim_get_current_tabpage() then
+      return
+    end
+
+    -- only resize when needed so the resulting WinResized event settles without a loop
+    resize_terminal_session_rail(win)
+  end)
+end
+
 local function configure_terminal_session_rail(win)
   if not is_valid_win(win) then
     return
@@ -504,7 +531,7 @@ local function configure_terminal_session_rail(win)
   pcall(vim.api.nvim_set_option_value, "winbar", "", { scope = "local", win = win })
   pcall(vim.api.nvim_set_option_value, "fillchars", "eob: ", { scope = "local", win = win })
   pcall(vim.api.nvim_set_option_value, "winhighlight", terminal_session_winhighlight, { scope = "local", win = win })
-  pcall(vim.api.nvim_win_set_width, win, terminal_session_width)
+  resize_terminal_session_rail(win)
 end
 
 local function ensure_terminal_session_rail(term_win)
@@ -2314,6 +2341,10 @@ function M.setup()
   vim.api.nvim_create_autocmd("ColorScheme", {
     group = group,
     callback = setup_terminal_session_highlights,
+  })
+  vim.api.nvim_create_autocmd({ "WinResized", "VimResized", "WinNew", "WinClosed", "TabEnter" }, {
+    group = group,
+    callback = schedule_terminal_layout_refresh,
   })
   vim.api.nvim_create_autocmd("WinClosed", {
     group = group,
